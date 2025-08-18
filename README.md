@@ -1,121 +1,154 @@
-# Llama-3 Korean Chat API
+# 🤖 한국어 AI 챗봇
 
-FastAPI 기반의 Llama-3 한국어 챗봇 웹 서비스입니다. MLP-KTLim/llama-3-Korean-Bllossom-8B 모델을 사용합니다.
+한국어에 특화된 AI 챗봇 서비스입니다. 친근하고 유능한 AI 어시스턴트와 자연스러운 한국어 대화를 나눌 수 있습니다.
 
-## 🌐 온라인 데모
+## ✨ 주요 기능
 
-- **웹 인터페이스**: 브라우저에서 바로 사용 가능한 채팅 인터페이스
-- **API 엔드포인트**: 다른 애플리케이션에서 사용할 수 있는 REST API
-- **자동 문서**: `/docs`에서 Swagger UI로 API 문서 확인
-- **모델**: MLP-KTLim/llama-3-Korean-Bllossom-8B (8B 파라미터)
+- 🇰🇷 **한국어 특화**: 한국어에 최적화된 AI 모델 사용
+- 💬 **자연스러운 대화**: 친근하고 예의 바른 톤으로 소통
+- 🎨 **아름다운 UI**: 모던하고 직관적인 웹 인터페이스
+- 📱 **반응형 디자인**: 모바일과 데스크톱 모두 지원
+- ⚡ **빠른 응답**: 최적화된 모델로 빠른 응답 속도
+- 🔧 **쉬운 배포**: Render.com 원클릭 배포 지원
 
-## 🚀 장점
+## 🚀 기술 스택
 
-- **멀티 작업 지원**: 여러 사용자가 동시에 사용 가능
-- **크로스 플랫폼**: Windows, macOS, Linux에서 동일하게 작동
-- **리소스 효율성**: Ollama가 모델을 별도로 관리
-- **확장성**: 웹 API로 다양한 클라이언트에서 접근 가능
+- **Backend**: FastAPI, Python 3.11
+- **AI Model**: KoAlpaca-Polyglot-5.8B (한국어 최적화)
+- **Frontend**: HTML5, CSS3, JavaScript
+- **Deployment**: Render.com
+- **Hardware**: Apple M4 Pro (24GB RAM) 최적화
 
-## 📋 사전 요구사항
+## 📦 설치 및 실행
 
-1. **Ollama 설치**
-   - [Ollama 공식 사이트](https://ollama.ai/)에서 다운로드
-   - Windows: `winget install Ollama.Ollama`
-   - macOS: `brew install ollama`
+### 로컬 개발 환경
 
-2. **모델 다운로드**
-   ```bash
-   ollama pull mayo/llama-3-korean-bllossom-8b
-   ```
+1. **저장소 클론**
+```bash
+git clone <repository-url>
+cd helper
+```
 
-## 🛠️ 로컬 설치 및 실행
+2. **가상환경 생성 및 활성화**
+```bash
+python -m venv venv
+source venv/bin/activate  # macOS/Linux
+# 또는
+venv\Scripts\activate  # Windows
+```
 
-1. **의존성 설치**
-   ```bash
-   pip install -r requirements.txt
-   ```
+3. **의존성 설치**
+```bash
+pip install -r requirements.txt
+```
 
-2. **FastAPI 서버 실행**
-   ```bash
-   python main.py
-   # 또는
-   uvicorn main:app --reload --host 0.0.0.0 --port 8000
-   ```
+4. **서버 실행**
+```bash
+python main.py
+```
 
-3. **웹 브라우저에서 접속**
-   ```
-   http://localhost:8000
-   ```
+5. **브라우저에서 접속**
+```
+http://localhost:8000
+```
 
-**참고**: 첫 실행 시 모델 다운로드에 시간이 걸릴 수 있습니다 (약 15-20GB).
+### Render.com 배포
 
-## 🚀 무료 호스팅 배포
+1. **GitHub에 코드 푸시**
+2. **Render.com에서 새 Web Service 생성**
+3. **GitHub 저장소 연결**
+4. **자동 배포 완료**
 
-### Render.com 배포 (권장)
+## 🎯 사용법
 
-1. **GitHub에 코드 업로드**
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git remote add origin https://github.com/yourusername/llama3-korean-chat.git
-   git push -u origin main
-   ```
-
-2. **Render.com에서 새 서비스 생성**
-   - [Render.com](https://render.com)에 가입
-   - "New Web Service" 클릭
-   - GitHub 저장소 연결
-   - 환경 변수 설정:
-     - `OLLAMA_API_URL`: 실제 Ollama 서버 URL
-     - `MODEL_NAME`: 사용할 모델명
-
-3. **배포 완료**
-   - 자동으로 배포가 시작됩니다
-   - 배포 완료 후 제공되는 URL로 접속
-
-### 다른 플랫폼
-
-- **Heroku**: `Procfile` 사용
-- **Railway**: `railway.json` 설정
-- **Vercel**: `vercel.json` 설정
-
-## 🌐 API 엔드포인트
-
-- `GET /`: 서버 정보
-- `POST /chat`: 챗봇 대화
-- `GET /health`: 서버 상태 확인
-- `GET /models`: 사용 가능한 모델 목록
-
-## 📊 성능 비교
-
-| 항목 | 현재 test.py | FastAPI 기반 |
-|------|-------------|-------------|
-| 동시 사용자 | 1명 | 다수 |
-| 메모리 사용 | 높음 | 낮음 |
-| 확장성 | 제한적 | 우수 |
-| 플랫폼 호환성 | 제한적 | 우수 |
-| 에러 처리 | 기본적 | 체계적 |
+1. 웹 브라우저에서 챗봇 페이지 접속
+2. 하단 입력창에 메시지 입력
+3. Enter 키 또는 전송 버튼 클릭
+4. AI의 응답 확인
+5. 제안된 질문 버튼으로 빠른 시작 가능
 
 ## 🔧 설정 옵션
 
-`main.py`에서 다음 설정을 변경할 수 있습니다:
+### 모델 설정
+- **모델**: `beomi/KoAlpaca-Polyglot-5.8B`
+- **메모리 할당**: 20GB (M4 Pro 24GB RAM 기준)
+- **생성 토큰**: 최대 1024개
+- **온도**: 0.7 (창의성과 일관성의 균형)
 
-```python
-MODEL_NAME = "mayo/llama-3-korean-bllossom-8b"  # 모델명
-OLLAMA_API_URL = "http://localhost:11434/api/generate"  # Ollama API 주소
+### 환경 변수
+```bash
+PORT=8000  # 서버 포트
+PYTHON_VERSION=3.11  # Python 버전
 ```
 
-## 🚨 문제 해결
+## 📊 성능 최적화
 
-1. **Ollama 연결 오류**
-   - Ollama가 실행 중인지 확인
-   - `ollama serve` 명령어로 서버 시작
+- **메모리 최적화**: M4 Pro 24GB RAM에 맞춘 설정
+- **모델 양자화**: float16 사용으로 메모리 효율성 향상
+- **배치 처리**: torch.no_grad() 사용으로 추론 속도 개선
+- **반복 방지**: repetition_penalty 적용
 
-2. **모델 다운로드 오류**
-   - 인터넷 연결 확인
-   - `ollama pull mayo/llama-3-korean-bllossom-8b` 재실행
+## 🛠️ API 엔드포인트
 
-3. **포트 충돌**
-   - `main.py`에서 포트 번호 변경
-   - 다른 서비스와 포트 충돌 확인 
+### POST /chat
+챗봇과 대화를 수행합니다.
+
+**요청 예시:**
+```json
+{
+  "prompt": "안녕하세요!",
+  "max_new_tokens": 1024,
+  "temperature": 0.7,
+  "top_p": 0.9
+}
+```
+
+**응답 예시:**
+```json
+{
+  "response": "안녕하세요! 반갑습니다. 무엇을 도와드릴까요?",
+  "model": "beomi/KoAlpaca-Polyglot-5.8B",
+  "status": "success"
+}
+```
+
+### GET /health
+서버 상태를 확인합니다.
+
+### GET /info
+모델 정보를 반환합니다.
+
+## 🎨 UI 특징
+
+- **모던한 디자인**: 그라데이션과 그림자 효과
+- **애니메이션**: 부드러운 전환 효과
+- **타이핑 인디케이터**: AI 응답 생성 중 시각적 피드백
+- **제안 질문**: 빠른 시작을 위한 버튼
+- **반응형 레이아웃**: 모든 디바이스 지원
+
+## 🔒 보안 및 안정성
+
+- **입력 검증**: 사용자 입력에 대한 검증
+- **오류 처리**: 친화적인 오류 메시지
+- **CORS 설정**: 웹 브라우저 호환성
+- **메모리 관리**: 효율적인 리소스 사용
+
+## 🤝 기여하기
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+## 📝 라이선스
+
+이 프로젝트는 MIT 라이선스 하에 배포됩니다.
+
+## 📞 지원
+
+문제가 있거나 제안사항이 있으시면 이슈를 생성해주세요.
+
+---
+
+**한국어 AI 챗봇**으로 더 나은 AI 경험을 시작해보세요! 🚀

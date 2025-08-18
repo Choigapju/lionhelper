@@ -1,14 +1,12 @@
 services:
   - type: web
-    name: llama3-korean-chat
+    name: korean-chatbot
     env: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
-      - key: OLLAMA_API_URL
-        value: https://your-ollama-server.com/api/generate  # 실제 Ollama 서버 URL로 변경
-      - key: MODEL_NAME
-        value: llama3.2:8b 
+        value: 3.11
+      - key: PORT
+        value: 8000
