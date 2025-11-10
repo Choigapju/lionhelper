@@ -1,18 +1,19 @@
 
 import os
 import time
-import json
 import uuid
 import logging
-import sqlite3
-import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import uvicorn
+import re
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
-import httpx
-from openai import OpenAI
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
 from anthropic import Anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -35,26 +36,25 @@ logger = logging.getLogger(__name__)
 # 비밀번호 해싱
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# JWT 설정
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
 # Google OAuth 설정
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "your-google-client-id")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "your-google-client-secret")
+
+# 슬랙 API 설정
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = "C08M47TM2KH"  # 지정된 채널 ID
+slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
 # google_oauth = GoogleOAuth2(  # 임시 비활성화
 #     client_id=GOOGLE_CLIENT_ID,
 #     client_secret=GOOGLE_CLIENT_SECRET,
 #     redirect_uri="http://localhost:8001/auth/google/callback"
 # )
-
-# JWT 토큰 생성 함수
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
 
 # JWT 토큰 검증 함수
 def verify_token(token: str):
@@ -63,37 +63,6 @@ def verify_token(token: str):
         return payload
     except JWTError:
         return None
-
-# 사용자 관련 함수들
-def get_user_by_email(email: str):
-    """이메일로 사용자 조회"""
-    conn = sqlite3.connect('chat_history.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE email = ?', (email,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-def create_user(user_data: dict):
-    """새 사용자 생성"""
-    conn = sqlite3.connect('chat_history.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO users (id, email, name, picture)
-        VALUES (?, ?, ?, ?)
-    ''', (user_data['id'], user_data['email'], user_data['name'], user_data.get('picture')))
-    conn.commit()
-    conn.close()
-
-def update_user_login(user_id: str):
-    """사용자 마지막 로그인 시간 업데이트"""
-    conn = sqlite3.connect('chat_history.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?
-    ''', (user_id,))
-    conn.commit()
-    conn.close()
 
 # JWT 토큰 의존성
 security = HTTPBearer()
@@ -110,235 +79,39 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
     return payload
 
-# OpenAI GPT-4o-mini 설정
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-USE_GPT4O_MINI = os.getenv("USE_GPT4O_MINI", "false").lower() == "true"
-
 # Anthropic Claude API 설정
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 USE_CLAUDE = os.getenv("USE_CLAUDE", "true").lower() == "true"
 
-class GPTAPIClient:
-    def __init__(self, api_key):
-        """GPT API 클라이언트 초기화"""
-        if not api_key:
-            raise ValueError("API 키가 제공되지 않았습니다.")
-            
-        self.logger = logging.getLogger(__name__)
-        self.model = "gpt-4o-mini"
-        
-        # httpx 클라이언트 설정
-        http_client = httpx.Client()
-        
-        # OpenAI 클라이언트 초기화
-        self.client = OpenAI(
-            api_key=api_key,
-            http_client=http_client
-        )
-        
-        self.logger.info(f"GPTAPIClient 초기화 완료 (모델: {self.model})")
+# Ollama 설정 (백업용)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "GPT-OSS-20B")
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        reraise=True
-    )
-    def make_request(self, prompt: str, max_tokens: int = 2000) -> Optional[str]:
-        """GPT API 요청 수행"""
-        self.logger.info(f"API 요청 시작 (프롬프트 길이: {len(prompt)} 문자)")
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=max_tokens
+# PostgreSQL 데이터베이스 설정
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://username:password@localhost:5432/chat_history")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "chat_history")
+DB_USER = os.getenv("DB_USER", "username")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+
+def get_db_connection():
+    """PostgreSQL 데이터베이스 연결 함수"""
+    try:
+        if DATABASE_URL and DATABASE_URL != "postgresql://username:password@localhost:5432/chat_history":
+            return psycopg2.connect(DATABASE_URL)
+        else:
+            return psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD
             )
-            
-            if response and response.choices:
-                result = response.choices[0].message.content
-                self.logger.info("API 요청 성공")
-                return result
-            else:
-                self.logger.error("API 응답이 비어있음")
-                raise Exception("API 응답이 비어있습니다")
-                
-        except Exception as e:
-            self.logger.error(f"API 요청 실패: {str(e)}")
-            raise
+    except psycopg2.Error as e:
+        logger.error(f"데이터베이스 연결 오류: {e}")
+        raise
 
-    def split_text(self, text: str, max_chunk_size: int = 2000) -> List[str]:
-        """텍스트를 청크로 분할"""
-        if not text:
-            logger.warning("분할할 텍스트가 비어있음")
-            return []
-            
-        logger.info(f"텍스트 분할 시작 (전체 길이: {len(text)} 문자)")
-        chunks = []
-        sentences = text.replace('\r', '').split('\n')
-        
-        current_chunk = []
-        current_size = 0
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-                
-            sentence_size = len(sentence)
-            if current_size + sentence_size > max_chunk_size:
-                if current_chunk:
-                    chunk_text = '\n'.join(current_chunk)
-                    chunks.append(chunk_text)
-                    logger.debug(f"청크 생성: {len(chunk_text)} 문자")
-                current_chunk = [sentence]
-                current_size = sentence_size
-            else:
-                current_chunk.append(sentence)
-                current_size += sentence_size
-                
-        if current_chunk:
-            chunk_text = '\n'.join(current_chunk)
-            chunks.append(chunk_text)
-            logger.debug(f"마지막 청크 생성: {len(chunk_text)} 문자")
-            
-        logger.info(f"텍스트 분할 완료 (총 {len(chunks)}개 청크)")
-        return chunks
-
-    def analyze_text(self, text: str, analysis_type: str = 'vtt') -> str:
-        """텍스트 분석을 수행"""
-        try:
-            # 텍스트를 청크로 분할
-            logger.info(f"텍스트 분석 시작 (유형: {analysis_type})")
-            chunks = self.split_text(text)
-            
-            # 각 청크별로 분석 수행
-            results = []
-            for i, chunk in enumerate(chunks, 1):
-                logger.info(f"청크 {i}/{len(chunks)} 분석 중")
-                
-                # 분석 유형에 따른 프롬프트 설정
-                if analysis_type == 'vtt':
-                    prompt = f"""
-다음은 강의 내용을 텍스트로 변환한 것입니다. 강의 내용을 분석하여 다음 형식으로 응답해주세요:
-
-[강의 내용]
-{chunk}
-
-다음 형식으로 응답해주세요:
-# 주요 내용
-(이 부분의 주요 내용을 2-3문장으로 요약)
-
-# 키워드
-(주요 키워드를 쉼표로 구분하여 나열)
-
-# 분석
-(강의 내용에 대한 전반적인 분석을 3-4문장으로 작성)
-
-# 위험 발언
-(차별적 발언, 부적절한 표현, 민감한 주제 등이 있다면 구체적으로 명시. 없다면 "위험 발언이 없습니다." 라고 표시)
-"""
-                elif analysis_type == 'chat':
-                    prompt = f"""다음 채팅 내용을 분석하여 아래 형식으로 응답해주세요.
-
-# 주요 대화 주제
-- 채팅에서 다뤄진 주요 주제와 내용을 요약하여 나열
-
-# 수강생 감정/태도 분석
-1. 긍정적 반응
-- 수업 내용에 대한 이해와 만족을 표현한 내용
-- 적극적인 참여와 긍정적인 피드백
-
-2. 부정적 반응
-- 수업 내용이나 진행에 대한 불만이나 어려움 표현
-- 부정적인 감정이나 태도가 드러난 내용
-
-3. 질문/요청사항
-- 수업 내용에 대한 질문
-- 수업 진행 방식에 대한 요청사항
-
-# 어려움/불만 상세 분석
-1. 학습적 어려움
-- 수업 내용의 난이도나 이해 문제
-- 학습 진도나 과제 관련 어려움
-
-2. 수업 진행 관련 문제
-- 수업 속도나 시간 배분 문제
-- 강의 방식이나 상호작용 관련 문제
-
-3. 기술적 문제
-- 온라인 플랫폼 사용의 어려움
-- 음질, 화질 등 기술적 문제
-
-# 개선 제안
-1. 학습 내용 개선
-- 수업 내용의 난이도 조정 제안
-- 추가 학습 자료나 예제 요청
-
-2. 수업 방식 개선
-- 수업 진행 방식 개선 제안
-- 상호작용 방식 개선 제안
-
-3. 기술적 지원 강화
-- 온라인 플랫폼 개선 제안
-- 기술적 문제 해결을 위한 제안
-
-# 위험 발언 및 주의사항
-- 부적절한 언어 사용이나 태도
-- 수업 분위기를 해치는 발언
-- 개인정보 노출 위험
-
-# 종합 제언
-- 전반적인 개선점과 권장사항
-- 향후 수업 운영을 위한 제안사항
-
-채팅 내용:
-{chunk}"""
-                else:
-                    prompt = f"""
-다음 텍스트를 분석하여 주요 내용을 요약해주세요:
-
-[텍스트 내용]
-{chunk}
-
-다음 형식으로 응답해주세요:
-# 요약
-(주요 내용을 3-4문장으로 요약)
-"""
-                
-                try:
-                    result = self.make_request(prompt)
-                    if result:
-                        results.append(result)
-                    else:
-                        results.append(f"[청크 {i} 분석 실패]")
-                except Exception as e:
-                    logger.error(f"청크 {i} 분석 중 오류 발생: {str(e)}")
-                    results.append(f"[청크 {i} 분석 오류: {str(e)}]")
-                
-                # 마지막 청크가 아닌 경우 API 호출 간격 유지
-                if i < len(chunks):
-                    time.sleep(2)
-            
-            final_result = "\n\n---\n\n".join(results)
-            logger.info("텍스트 분석 완료")
-            return final_result
-            
-        except Exception as e:
-            logger.error(f"분석 중 예상치 못한 오류 발생: {str(e)}")
-            return f"분석 중 오류 발생: {str(e)}"
-
-    def test_connection(self) -> bool:
-        """API 연결 테스트"""
-        try:
-            logger.info("API 연결 테스트 시작")
-            result = self.make_request("안녕하세요", max_tokens=10)
-            return bool(result)
-        except Exception as e:
-            logger.error(f"API 연결 테스트 실패: {str(e)}")
-            return False
+# GPTAPIClient 클래스 제거됨 - Claude 전용 시스템으로 전환
 
 
 class ClaudeAPIClient:
@@ -405,62 +178,107 @@ if ANTHROPIC_API_KEY:
     except Exception as e:
         logger.warning(f"Claude 클라이언트 초기화 실패: {str(e)}")
 
-# GPT-4o-mini 클라이언트 초기화 (API 키가 있는 경우에만)
-gpt_client = None
-if OPENAI_API_KEY:
-    try:
-        gpt_client = GPTAPIClient(OPENAI_API_KEY)
-        logger.info("GPT-4o-mini 클라이언트 초기화 완료")
-    except Exception as e:
-        logger.warning(f"GPT-4o-mini 클라이언트 초기화 실패: {str(e)}")
+# GPT 관련 코드 제거됨 - Claude 전용 시스템
 
 # 데이터베이스 초기화
 def init_database():
-    """SQLite 데이터베이스 초기화"""
-    conn = sqlite3.connect('chat_history.db')
+    """PostgreSQL 데이터베이스 초기화"""
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 세션 테이블
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    try:
+        # 세션 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                id VARCHAR(255) PRIMARY KEY,
+                title VARCHAR(500) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 메시지 테이블
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id VARCHAR(255) PRIMARY KEY,
+                session_id VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL,
+                content TEXT NOT NULL,
+                response_type VARCHAR(100),
+                model_used VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions (id)
+            )
+        ''')
+        
+        # 사용자 테이블 생성
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id VARCHAR(255) PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                picture TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # 슬랙 이슈 테이블 생성
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS slack_issues (
+                id VARCHAR(255) PRIMARY KEY,
+                project VARCHAR(255) NOT NULL,
+                issue_type VARCHAR(100) NOT NULL,
+                author VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                raw_message TEXT NOT NULL,
+                channel_id VARCHAR(255),
+                timestamp VARCHAR(255),
+                slack_ts VARCHAR(255) UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     
-    # 메시지 테이블
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            response_type TEXT,
-            model_used TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (session_id) REFERENCES sessions (id)
-        )
-    ''')
-    
-    # 사용자 테이블 생성
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            picture TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+        # 답변 피드백 테이블 생성
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS answer_feedback (
+                id VARCHAR(255) PRIMARY KEY,
+                session_id VARCHAR(255) NOT NULL,
+                message_id VARCHAR(255) NOT NULL,
+                user_question TEXT NOT NULL,
+                ai_answer TEXT NOT NULL,
+                feedback_type VARCHAR(50) NOT NULL, -- 'positive', 'negative', 'correction'
+                feedback_content TEXT,
+                user_correction TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions (id),
+                FOREIGN KEY (message_id) REFERENCES messages (id)
+            )
+        ''')
+        
+        # 답변 개선 로그 테이블 생성
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS improvement_logs (
+                id VARCHAR(255) PRIMARY KEY,
+                issue_type VARCHAR(100) NOT NULL,
+                original_answer TEXT NOT NULL,
+                improved_answer TEXT NOT NULL,
+                improvement_reason TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        logger.info("PostgreSQL 데이터베이스 초기화 완료")
+        
+    except psycopg2.Error as e:
+        logger.error(f"데이터베이스 초기화 오류: {e}")
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-# 데이터베이스 초기화 실행
-init_database()
+# 데이터베이스 초기화는 앱 시작 시점에 실행 (지연 초기화)
 
 # QA 데이터베이스 (키워드 기반 빠른 응답)
 QA_DATABASE = {
@@ -943,6 +761,14 @@ POST /chat
         {
             "name": "Search",
             "description": "🔍 검색 엔진 - 관련 질문들을 점수순으로 검색하고 반환"
+        },
+        {
+            "name": "Slack",
+            "description": "🔔 슬랙 연동 - 슬랙 채널에서 이슈 메시지를 수집하고 관리"
+        },
+        {
+            "name": "Feedback",
+            "description": "📝 피드백 시스템 - 답변 품질 개선을 위한 사용자 피드백 수집 및 분석"
         }
     ]
 )
@@ -1017,11 +843,24 @@ try:
 except:
     pass
 
-print("GPT-4o-mini + 키워드 기반 하이브리드 AI 챗봇 시스템이 로드되었습니다.")
-if gpt_client:
-    print("GPT-4o-mini: 활성화됨")
+# 앱 시작 시 데이터베이스 초기화
+@app.on_event("startup")
+async def startup_event():
+    """앱 시작 시 데이터베이스 초기화"""
+    try:
+        logger.info("데이터베이스 초기화 시작...")
+        init_database()
+        logger.info("데이터베이스 초기화 완료!")
+    except Exception as e:
+        logger.error(f"데이터베이스 초기화 실패: {e}")
+        # 데이터베이스 초기화 실패해도 앱은 계속 실행
+        pass
+
+print("🤖 Claude + 키워드 기반 지능형 AI 챗봇 시스템이 로드되었습니다.")
+if claude_client:
+    print("Claude-3-Haiku: 활성화됨")
 else:
-    print("GPT-4o-mini: 비활성화됨 (API 키 확인 필요)")
+    print("Claude-3-Haiku: 비활성화됨 (API 키 확인 필요)")
 
 # CORS preflight 요청을 위한 OPTIONS 핸들러
 @app.options("/{full_path:path}")
@@ -1039,25 +878,50 @@ async def options_handler(request: Request, full_path: str):
 
 # Pydantic 모델
 class ChatRequest(BaseModel):
-    """AI 챗봇 대화 요청 모델"""
-    prompt: str = Field(..., description="사용자 질문 또는 메시지", example="훈련장려금은 얼마인가요?")
-    max_new_tokens: Optional[int] = Field(512, description="최대 생성 토큰 수", example=512, ge=1, le=2048)
-    temperature: Optional[float] = Field(0.6, description="창의성 조절 (0.0-2.0)", example=0.6, ge=0.0, le=2.0)
+    """
+    ## 🧠 Claude 지능형 챗봇 요청 모델
+    
+    Claude-3-Haiku + Knowledge Base 지능형 시스템
+    """
+    prompt: str = Field(..., description="사용자 질문 또는 메시지", example="안녕? 훈련장려금 언제 받을 수 있어?")
+    max_new_tokens: Optional[int] = Field(1000, description="Claude 응답 최대 토큰 수 (권장: 1000)", example=1000, ge=50, le=2048)
+    temperature: Optional[float] = Field(0.7, description="Claude 창의성 조절 (권장: 0.7)", example=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(0.9, description="확률 임계값 (0.0-1.0)", example=0.9, ge=0.0, le=1.0)
-    use_claude: Optional[bool] = Field(True, description="Claude 모델 사용 여부", example=True)
-    use_gpt4o: Optional[bool] = Field(False, description="GPT-4o-mini 모델 사용 여부", example=False)
-    session_id: Optional[str] = Field(None, description="대화 세션 ID (맥락 이해용)", example="123e4567-e89b-12d3-a456-426614174000")
+    use_claude: Optional[bool] = Field(True, description="🧠 Claude 지능형 응답 사용 (기본값: true)", example=True)
+    session_id: Optional[str] = Field(None, description="대화 세션 ID (대화 기록용)", example="claude-chat-001")
 
     class Config:
         schema_extra = {
-            "example": {
-                "prompt": "훈련장려금은 언제 받을 수 있나요?",
-                "max_new_tokens": 512,
-                "temperature": 0.6,
-                "top_p": 0.9,
-                "use_claude": True,
-                "use_gpt4o": False,
-                "session_id": "123e4567-e89b-12d3-a456-426614174000"
+            "examples": {
+                "claude_enhanced": {
+                    "summary": "🧠 Claude 지능형 답변 (추천)",
+                    "description": "Claude가 키워드 DB 참고해서 전문적 답변 생성",
+                    "value": {
+                        "prompt": "훈련장려금은 언제 받을 수 있나요?",
+                        "use_claude": True,
+                        "max_new_tokens": 1000,
+                        "temperature": 0.7,
+                        "session_id": "claude-enhanced-001"
+                    }
+                },
+                "claude_general": {
+                    "summary": "💬 Claude 일반 대화",
+                    "description": "일반적인 질문이나 인사말에 대한 자연스러운 응답",
+                    "value": {
+                        "prompt": "안녕? 파이썬 코딩 질문해도 돼?",
+                        "use_claude": True,
+                        "session_id": "general-chat-001"
+                    }
+                },
+                "keyword_fallback": {
+                    "summary": "📚 키워드 응답 (Claude 비활성화)",
+                    "description": "Claude 사용하지 않고 키워드 DB만 사용",
+                    "value": {
+                        "prompt": "출결 관리는 어떻게 하나요?",
+                        "use_claude": False,
+                        "session_id": "keyword-only-001"
+                    }
+                }
             }
         }
 
@@ -1070,33 +934,79 @@ class RelatedQuestion(BaseModel):
     matched_keywords: List[str] = Field(..., description="매칭된 키워드")
 
 class ChatResponse(BaseModel):
-    """AI 챗봇 응답 모델"""
-    response: str = Field(..., description="AI의 응답 메시지", example="훈련장려금은 해당 과정의 단위기간 마감일을 기준으로 지급까지 2주에서 3주 가량 소요됩니다")
-    model: str = Field(..., description="사용된 모델명", example="Keyword-based Fast Response System")
-    status: str = Field(..., description="응답 상태", example="success")
-    matched_keywords: Optional[List[str]] = Field(None, description="매칭된 키워드 목록", example=["훈련장려금", "언제", "받기"])
-    response_type: str = Field(..., description="응답 유형 (keyword/ollama/fallback)", example="keyword")
-    related_questions: Optional[List[RelatedQuestion]] = Field(None, description="관련 질문 목록")
+    """
+    ## 🧠 Claude 지능형 챗봇 응답 모델
+    
+    Claude + Knowledge Base 지능형 시스템의 응답
+    """
+    response: str = Field(..., description="Claude 지능형 응답 또는 키워드 기반 응답", example="안녕하세요! 훈련장려금에 대해 자세히 안내드리겠습니다...")
+    model: str = Field(..., description="사용된 모델 (Claude + Knowledge Base/Keyword Database)", example="Claude-3-Haiku + Knowledge Base")
+    status: str = Field(..., description="응답 상태 (success/error/fallback)", example="success")
+    matched_keywords: Optional[List[str]] = Field(None, description="참고된 키워드 목록", example=["훈련장려금", "출석", "지급"])
+    response_type: str = Field(..., description="응답 유형 (claude_enhanced/smart_keyword/fallback)", example="claude_enhanced")
+    related_questions: Optional[List[RelatedQuestion]] = Field(None, description="관련 질문 목록 (키워드 DB)")
     total_related: Optional[int] = Field(None, description="관련 질문 총 개수")
+    response_time_ms: Optional[float] = Field(None, description="응답 생성 시간 (밀리초)", example=1234.5)
+    model_response_time_ms: Optional[float] = Field(None, description="AI 모델 응답 시간 (밀리초)", example=987.3)
 
     class Config:
         schema_extra = {
-            "example": {
-                "response": "훈련장려금은 해당 과정의 단위기간 마감일을 기준으로 지급까지 2주에서 3주 가량 소요됩니다\n1단위기간의 경우, 확인할 사항이 많아 시간이 다소 소요될 수 있다는 점 참고 부탁드립니다.",
-                "model": "Keyword-based Fast Response System",
-                "status": "success",
-                "matched_keywords": ["훈련장려금", "언제", "받기", "단위기간", "2주"],
-                "response_type": "keyword",
+            "examples": {
+                "claude_enhanced_response": {
+                    "summary": "🧠 Claude 지능형 응답",
+                    "description": "Claude가 키워드 DB 참고해서 생성한 전문적 답변",
+                    "value": {
+                        "response": "안녕하세요! 훈련장려금에 대해 안내드리겠습니다.\n\n💰 **훈련장려금 지급 기준:**\n- 일일 15,800원 지급\n- 하루 수업을 모두 참여해야 함\n- 지각, 조퇴, 외출 시 지급 불가\n\n📅 **지급 시기:**\n- 단위기간 마감 후 2-3주 소요\n- 80% 이상 출석률 유지 필요\n\n💡 **추가 팁:**\n- HRD앱으로 출결 체크 필수\n- 공결 신청은 미리 해주세요!\n\n궁금한 점이 더 있으시면 언제든 말씀해 주세요! 😊",
+                        "model": "Claude-3-Haiku + Knowledge Base",
+                        "status": "success",
+                        "matched_keywords": ["훈련장려금", "출석", "지급"],
+                        "response_type": "claude_enhanced",
+                        "related_questions": [
+                            {
+                                "id": "qa_123",
+                                "question": "훈련장려금 지급 조건은?",
+                                "answer_preview": "하루 수업을 모두 참여시 일일 15,800원...",
+                                "score": 0.95,
+                                "matched_keywords": ["훈련장려금", "지급"]
+                            }
+                        ],
+                        "total_related": 5
+                    }
+                },
+                "claude_general_response": {
+                    "summary": "💬 Claude 일반 대화 응답",
+                    "description": "일반적인 질문에 대한 친근한 Claude 응답",
+                    "value": {
+                        "response": "안녕하세요! 네, 파이썬 코딩 질문 언제든 환영합니다! 🐍\n\n어떤 부분이 궁금하신가요? 기초 문법부터 고급 기능까지 도움을 드릴 수 있어요. 웹 개발, 데이터 분석, 알고리즘 등 어떤 분야든 편하게 질문해 주세요!\n\n같이 코딩 실력을 늘려가봐요! 💪",
+                        "model": "Claude-3-Haiku + Knowledge Base",
+                        "status": "success",
+                        "matched_keywords": [],
+                        "response_type": "claude_enhanced",
+                        "related_questions": [],
+                        "total_related": 0
+                    }
+                },
+                "keyword_fallback_response": {
+                    "summary": "📚 키워드 DB 응답 (Claude 실패 시)",
+                    "description": "Claude 사용 불가 시 키워드 DB 기반 응답",
+                    "value": {
+                        "response": "훈련장려금은 해당 과정의 단위기간 마감일을 기준으로 지급까지 2주에서 3주 가량 소요됩니다.",
+                        "model": "Keyword Database",
+                        "status": "success",
+                        "matched_keywords": ["훈련장려금", "언제", "받기"],
+                        "response_type": "smart_keyword",
                 "related_questions": [
                     {
-                        "id": "훈련장려금_금액",
-                        "question": "훈련장려금은 얼마인가요?",
-                        "answer_preview": "훈련장려금은 하루 수업을 모두 참여시 일일 15,800원이...",
-                        "score": 4.2,
-                        "matched_keywords": ["훈련장려금", "얼마"]
+                                "id": "1",
+                                "question": "훈련장려금 금액은 얼마인가요?",
+                                "answer_preview": "하루 수업을 모두 참여시 일일 15,800원...",
+                                "score": 0.9,
+                                "matched_keywords": ["훈련장려금", "금액"]
+                            }
+                        ],
+                        "total_related": 5
                     }
-                ],
-                "total_related": 3
+                }
             }
         }
 
@@ -1173,6 +1083,411 @@ class Message(BaseModel):
             }
         }
 
+# 슬랙 관련 모델들
+class SlackIssue(BaseModel):
+    """슬랙 이슈 모델"""
+    id: str = Field(..., description="이슈 고유 ID")
+    project: str = Field(..., description="프로젝트/과정명")
+    issue_type: str = Field(..., description="이슈 유형")
+    author: str = Field(..., description="작성자")
+    content: str = Field(..., description="이슈 내용")
+    raw_message: str = Field(..., description="원본 메시지")
+    channel_id: Optional[str] = Field(None, description="채널 ID")
+    timestamp: Optional[str] = Field(None, description="타임스탬프")
+    slack_ts: Optional[str] = Field(None, description="슬랙 타임스탬프")
+    created_at: str = Field(..., description="생성 시간")
+
+class SlackSyncRequest(BaseModel):
+    """슬랙 동기화 요청 모델"""
+    hours: Optional[int] = Field(24, description="동기화할 시간 범위 (시간)", example=24)
+    force: Optional[bool] = Field(False, description="강제 동기화 여부", example=False)
+
+class FeedbackRequest(BaseModel):
+    """답변 피드백 요청 모델"""
+    session_id: str = Field(..., description="세션 ID")
+    message_id: str = Field(..., description="메시지 ID")
+    feedback_type: str = Field(..., description="피드백 유형", example="negative")
+    feedback_content: Optional[str] = Field(None, description="피드백 내용")
+    user_correction: Optional[str] = Field(None, description="사용자 수정 내용")
+
+class ImprovementSuggestion(BaseModel):
+    """답변 개선 제안 모델"""
+    issue_type: str = Field(..., description="이슈 유형")
+    current_answer: str = Field(..., description="현재 답변")
+    suggested_answer: str = Field(..., description="개선된 답변")
+    improvement_reason: str = Field(..., description="개선 이유")
+
+# 슬랙 관련 함수들
+def parse_slack_issue_message(text: str, user_name: str = None) -> Optional[Dict[str, str]]:
+    """슬랙 메시지에서 이슈 정보를 파싱합니다."""
+    # 멘션 태그가 포함된 메시지인지 확인 (@here, @everyone, @channel)
+    has_mention = any(mention in text for mention in ["<@here>", "<@everyone>", "<@channel>" ,"<!here>", "<!everyone>", "<!channel>"])
+    
+    # 특정 사용자들의 메시지인지 확인 (장지연, 김은지)
+    target_users = ["장지연", "김은지"]
+    is_target_user = user_name and user_name in target_users
+    
+    # 멘션이나 특정 사용자가 아니면 None 반환
+    if not has_mention and not is_target_user:
+        return None
+    
+    # 기본 정보 추출
+    issue_data = {}
+    
+    # 과정/프로젝트 추출 (정형화된 양식이 있으면 사용, 없으면 기본값)
+    project_match = re.search(r'과정[:：]\s*([^\n]+)', text)
+    if project_match:
+        issue_data['project'] = project_match.group(1).strip()
+    else:
+        # 정형화된 양식이 없으면 메시지에서 키워드 기반으로 프로젝트 추정
+        if any(keyword in text for keyword in ["프론트엔드", "frontend", "Front-end", "React", "Vue", "Angular"]):
+            issue_data['project'] = "프론트엔드 관련"
+        elif any(keyword in text for keyword in ["백엔드", "backend", "Back-end", "Django", "Spring", "Node.js"]):
+            issue_data['project'] = "백엔드 관련"
+        elif any(keyword in text for keyword in ["훈련장려금", "장려금", "출결", "공결"]):
+            issue_data['project'] = "행정 관련"
+        else:
+            issue_data['project'] = "일반 공지"
+    
+    # 내용 추출 (정형화된 양식이 있으면 사용, 없으면 전체 메시지)
+    content_match = re.search(r'내용[:：]\s*([^\n]+)', text)
+    if content_match:
+        issue_data['content'] = content_match.group(1).strip()
+    else:
+        # 멘션 태그를 제거하고 메시지 내용만 추출
+        content = re.sub(r'<@[^>]+>', '', text).strip()
+        content = re.sub(r'<!here>|<!everyone>|<!channel>', '', content).strip()
+        issue_data['content'] = content if content else "멘션 메시지"
+    
+    # 작성자 추출 (정형화된 양식이 있으면 사용, 없으면 기본값)
+    author_match = re.search(r'작성자[:：]\s*([^\n]+)', text)
+    if author_match:
+        issue_data['author'] = author_match.group(1).strip()
+    elif is_target_user:
+        # 특정 사용자의 메시지인 경우 해당 사용자명 사용
+        issue_data['author'] = user_name
+    else:
+        issue_data['author'] = "행정 담당자"
+    
+    # 이슈 유형 분류
+    issue_type = "일반"
+    if any(keyword in text for keyword in ["프론트엔드", "frontend", "Front-end", "React", "Vue", "Angular"]):
+        issue_type = "프론트엔드"
+    elif any(keyword in text for keyword in ["백엔드", "backend", "Back-end", "Django", "Spring", "Node.js"]):
+        issue_type = "백엔드"
+    elif any(keyword in text for keyword in ["훈련장려금", "장려금"]):
+        issue_type = "훈련장려금"
+    elif any(keyword in text for keyword in ["환경설정", "설정", "환경"]):
+        issue_type = "환경설정"
+    elif any(keyword in text for keyword in ["출결", "공결", "지각", "조퇴", "결석"]):
+        issue_type = "출결관리"
+    elif any(keyword in text for keyword in ["공지", "안내", "알림"]):
+        issue_type = "공지사항"
+    elif is_target_user:
+        # 특정 사용자의 메시지인 경우 "담당자 메시지"로 분류
+        issue_type = "담당자 메시지"
+    
+    issue_data['issue_type'] = issue_type
+    
+    # 멘션 태그가 있으면 무조건 저장 (정형화된 양식 불필요)
+    return issue_data
+
+def save_slack_issue(issue_data: Dict[str, str], raw_message: str, channel_id: str = None, timestamp: str = None, slack_ts: str = None) -> str:
+    """파싱된 슬랙 이슈를 데이터베이스에 저장합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    issue_id = str(uuid.uuid4())
+    
+    try:
+        cursor.execute('''
+            INSERT INTO slack_issues (id, project, issue_type, author, content, raw_message, channel_id, timestamp, slack_ts)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (
+            issue_id,
+            issue_data['project'],
+            issue_data['issue_type'],
+            issue_data['author'],
+            issue_data['content'],
+            raw_message,
+            channel_id,
+            timestamp,
+            slack_ts
+        ))
+        
+        conn.commit()
+        logger.info(f"슬랙 이슈 저장 완료: {issue_id}")
+        return issue_id
+        
+    except psycopg2.IntegrityError as e:
+        if "duplicate key value" in str(e):
+            logger.info(f"이미 존재하는 슬랙 메시지: {slack_ts}")
+            return None
+        raise
+    finally:
+        conn.close()
+
+def get_slack_issues(limit: int = 50, project: str = None) -> List[SlackIssue]:
+    """저장된 슬랙 이슈들을 조회합니다."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        if project:
+            cursor.execute('''
+                SELECT id, project, issue_type, author, content, raw_message, channel_id, timestamp, slack_ts, created_at
+                FROM slack_issues 
+                WHERE project LIKE %s
+                ORDER BY created_at DESC 
+                LIMIT %s
+            ''', (f'%{project}%', limit))
+        else:
+            cursor.execute('''
+                SELECT id, project, issue_type, author, content, raw_message, channel_id, timestamp, slack_ts, created_at
+                FROM slack_issues 
+                ORDER BY created_at DESC 
+                LIMIT %s
+            ''', (limit,))
+        
+        rows = cursor.fetchall()
+        issues = []
+        
+        for row in rows:
+            # created_at을 문자열로 변환
+            created_at_str = row[9].isoformat() if hasattr(row[9], 'isoformat') else str(row[9])
+            
+            issues.append(SlackIssue(
+                id=row[0],
+                project=row[1],
+                issue_type=row[2],
+                author=row[3],
+                content=row[4],
+                raw_message=row[5],
+                channel_id=row[6],
+                timestamp=row[7],
+                slack_ts=row[8],
+                created_at=created_at_str
+            ))
+        
+        return issues
+        
+    finally:
+        conn.close()
+
+async def fetch_slack_messages(hours: int = 24) -> List[Dict[str, Any]]:
+    """슬랙 채널에서 메시지를 가져옵니다."""
+    if not slack_client:
+        raise HTTPException(status_code=500, detail="슬랙 봇 토큰이 설정되지 않았습니다")
+    
+    try:
+        # 지정된 시간 이전의 타임스탬프 계산
+        oldest_time = time.time() - (hours * 3600)
+        
+        # 채널 메시지 가져오기
+        response = slack_client.conversations_history(
+            channel=SLACK_CHANNEL_ID,
+            oldest=str(oldest_time),
+            limit=100
+        )
+        
+        if not response["ok"]:
+            raise HTTPException(status_code=500, detail=f"슬랙 API 오류: {response.get('error', 'Unknown error')}")
+        
+        return response["messages"]
+        
+    except SlackApiError as e:
+        logger.error(f"슬랙 API 오류: {e}")
+        error_detail = f"슬랙 API 오류: {e.response['error'] if hasattr(e, 'response') and e.response else str(e)}"
+        raise HTTPException(status_code=500, detail=error_detail)
+
+async def sync_slack_issues(hours: int = 24, force: bool = False) -> Dict[str, Any]:
+    """슬랙 채널에서 이슈 메시지를 동기화합니다."""
+    try:
+        messages = await fetch_slack_messages(hours)
+        
+        new_issues = 0
+        skipped_issues = 0
+        errors = 0
+        
+        for message in messages:
+            # 봇 메시지나 편집된 메시지는 무시
+            if message.get("bot_id") or message.get("subtype") == "message_changed":
+                continue
+            
+            text = message.get("text", "")
+            slack_ts = message.get("ts")
+            user_id = message.get("user", "")
+            
+            # 사용자 정보 가져오기 (슬랙 API를 통해 실제 이름 조회)
+            user_name = None
+            if user_id:
+                try:
+                    user_info = slack_client.users_info(user=user_id)
+                    if user_info["ok"]:
+                        user_name = user_info["user"].get("real_name", "")
+                except Exception as e:
+                    logger.warning(f"사용자 정보 조회 실패: {e}")
+            
+            # 이슈 메시지인지 파싱 시도 (사용자 정보 포함)
+            issue_data = parse_slack_issue_message(text, user_name)
+            if not issue_data:
+                continue
+            
+            try:
+                # 데이터베이스에 저장
+                issue_id = save_slack_issue(
+                    issue_data=issue_data,
+                    raw_message=text,
+                    channel_id=SLACK_CHANNEL_ID,
+                    timestamp=message.get("ts"),
+                    slack_ts=slack_ts
+                )
+                
+                if issue_id:
+                    new_issues += 1
+                    logger.info(f"새로운 이슈 저장: {issue_data['project']} - {issue_data['content'][:50]}...")
+                else:
+                    skipped_issues += 1
+                    
+            except Exception as e:
+                logger.error(f"이슈 저장 중 오류: {e}")
+                errors += 1
+        
+        return {
+            "success": True,
+            "message": f"동기화 완료: 새로운 이슈 {new_issues}개, 건너뛴 이슈 {skipped_issues}개, 오류 {errors}개",
+            "new_issues": new_issues,
+            "skipped_issues": skipped_issues,
+            "errors": errors,
+            "total_messages": len(messages)
+        }
+        
+    except Exception as e:
+        logger.error(f"슬랙 동기화 오류: {e}", exc_info=True)
+        error_msg = str(e) if str(e) else f"알 수 없는 오류: {type(e).__name__}"
+        return {
+            "success": False,
+            "message": f"동기화 실패: {error_msg}",
+            "new_issues": 0,
+            "skipped_issues": 0,
+            "errors": 1,
+            "error_details": {
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "slack_client_available": bool(slack_client),
+                "slack_channel_id": SLACK_CHANNEL_ID
+            }
+        }
+
+def save_answer_feedback(session_id: str, message_id: str, user_question: str, ai_answer: str, 
+                        feedback_type: str, feedback_content: str = None, user_correction: str = None) -> bool:
+    """답변 피드백을 데이터베이스에 저장합니다."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        feedback_id = str(uuid.uuid4())
+        cursor.execute('''
+            INSERT INTO answer_feedback 
+            (id, session_id, message_id, user_question, ai_answer, feedback_type, feedback_content, user_correction)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (feedback_id, session_id, message_id, user_question, ai_answer, feedback_type, feedback_content, user_correction))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"피드백 저장 오류: {e}")
+        return False
+
+def analyze_feedback_patterns() -> Dict[str, Any]:
+    """피드백 패턴을 분석하여 개선점을 찾습니다."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 부정적 피드백이 많은 질문 유형 분석
+        cursor.execute('''
+            SELECT user_question, COUNT(*) as negative_count
+            FROM answer_feedback 
+            WHERE feedback_type = 'negative'
+            GROUP BY user_question
+            ORDER BY negative_count DESC
+            LIMIT 10
+        ''')
+        problematic_questions = cursor.fetchall()
+        
+        # 자주 수정되는 답변 패턴 분석
+        cursor.execute('''
+            SELECT user_correction, COUNT(*) as correction_count
+            FROM answer_feedback 
+            WHERE feedback_type = 'correction' AND user_correction IS NOT NULL
+            GROUP BY user_correction
+            ORDER BY correction_count DESC
+            LIMIT 10
+        ''')
+        common_corrections = cursor.fetchall()
+        
+        # 전체 피드백 통계
+        cursor.execute('''
+            SELECT feedback_type, COUNT(*) as count
+            FROM answer_feedback
+            GROUP BY feedback_type
+        ''')
+        feedback_stats = cursor.fetchall()
+        
+        conn.close()
+        
+        return {
+            "problematic_questions": [{"question": q[0], "count": q[1]} for q in problematic_questions],
+            "common_corrections": [{"correction": c[0], "count": c[1]} for c in common_corrections],
+            "feedback_stats": [{"type": f[0], "count": f[1]} for f in feedback_stats]
+        }
+    except Exception as e:
+        logging.error(f"피드백 분석 오류: {e}")
+        return {}
+
+def get_improvement_suggestions_from_issues() -> List[Dict[str, str]]:
+    """슬랙 이슈 데이터를 기반으로 답변 개선 제안을 생성합니다."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 최근 이슈들 가져오기
+        cursor.execute('''
+            SELECT project, issue_type, content, author
+            FROM slack_issues
+            ORDER BY created_at DESC
+            LIMIT 20
+        ''')
+        recent_issues = cursor.fetchall()
+        
+        suggestions = []
+        for issue in recent_issues:
+            project, issue_type, content, author = issue
+            
+            # 이슈 유형별 개선 제안 생성
+            if "정확도" in content or "틀린" in content or "잘못" in content:
+                suggestions.append({
+                    "issue_type": "답변 정확도",
+                    "description": f"{project}에서 {issue_type} 관련 정확도 문제 발생",
+                    "suggestion": "해당 분야의 QA 데이터베이스 업데이트 및 검증 강화 필요",
+                    "priority": "high"
+                })
+            elif "느린" in content or "속도" in content:
+                suggestions.append({
+                    "issue_type": "응답 속도",
+                    "description": f"{project}에서 응답 속도 문제 발생",
+                    "suggestion": "캐싱 시스템 개선 및 응답 최적화 필요",
+                    "priority": "medium"
+                })
+        
+        conn.close()
+        return suggestions
+    except Exception as e:
+        logging.error(f"개선 제안 생성 오류: {e}")
+        return []
+
 def analyze_question_intent(user_input: str) -> dict:
     """질문의 의도를 분석하여 카테고리와 유형을 반환합니다."""
     input_lower = user_input.lower().strip()
@@ -1209,14 +1524,36 @@ def analyze_question_intent(user_input: str) -> dict:
         "규정준수": ["해외여행", "해외출국", "장소이동", "개인소지", "화장실", "자리비움", "녹화본"]
     }
     
+    # 타사 교육기관 키워드들 (제한 대상) - 멋쟁이사자처럼은 제외
+    competitor_keywords = [
+        "스파르타", "코딩클럽", "코딩 클럽", "코드스테이츠", "코드스테이츠",
+        "위코드", "wecode", "바닐라코딩", "바닐라 코딩", "패스트캠퍼스",
+        "패스트 캠퍼스", "프로그래머스", "프로그래머스", "이노베이션",
+        "부트캠프", "코딩학원", "코딩 학원", "it학원", "it 학원",
+        "개발자교육", "개발자 교육", "프로그래밍학원", "프로그래밍 학원"
+    ]
+    
+    # 자사 키워드 (멋쟁이사자처럼 관련)
+    company_keywords = [
+        "멋쟁이사자처럼", "멋사", "kdt", "k-digital", "k digital"
+    ]
+    
     detected_intent = "일반_문의"
     detected_topic = "기타"
     confidence = 0.0
+    
+    # 타사 교육기관 관련 질문인지 확인 (자사 키워드가 포함된 경우 제외)
+    has_competitor_keywords = any(keyword in input_lower for keyword in competitor_keywords)
+    has_company_keywords = any(keyword in input_lower for keyword in company_keywords)
+    is_competitor_question = has_competitor_keywords and not has_company_keywords
     
     # 일반 대화인 경우 특별 처리
     if is_general_conversation:
         detected_topic = "일반대화"
         confidence = 0.0  # 키워드 매칭 점수를 낮춤
+    elif is_competitor_question:
+        detected_topic = "타사정보"
+        confidence = 1.0  # 타사 정보는 높은 신뢰도로 감지
     else:
         # 의도 분석
         for intent, keywords in intent_patterns.items():
@@ -1225,14 +1562,14 @@ def analyze_question_intent(user_input: str) -> dict:
                 detected_intent = intent
                 confidence += matches * 0.2
                 break
-        
-        # 주제 분석
-        for topic, keywords in topic_categories.items():
-            matches = sum(1 for keyword in keywords if keyword in input_lower)
-            if matches > 0:
-                detected_topic = topic
-                confidence += matches * 0.3
-                break
+    
+    # 주제 분석
+    for topic, keywords in topic_categories.items():
+        matches = sum(1 for keyword in keywords if keyword in input_lower)
+        if matches > 0:
+            detected_topic = topic
+            confidence += matches * 0.3
+            break
     
     return {
         "intent": detected_intent,
@@ -1240,7 +1577,8 @@ def analyze_question_intent(user_input: str) -> dict:
         "confidence": min(confidence, 1.0),
         "input_length": len(user_input),
         "question_words": len([w for w in input_lower.split() if w in ["뭐", "무엇", "어떤", "왜", "어디", "언제", "누구", "어떻게"]]),
-        "is_general_conversation": is_general_conversation
+        "is_general_conversation": is_general_conversation,
+        "is_competitor_question": is_competitor_question
     }
 
 def find_best_match(user_input: str) -> tuple:
@@ -1413,10 +1751,205 @@ def get_context_keywords(session_id: str) -> List[str]:
         logger.warning(f"컨텍스트 키워드 추출 실패: {str(e)}")
         return []
 
+def get_conversation_context(session_id: str, max_messages: int = 6) -> str:
+    """세션의 최근 대화 내용을 컨텍스트로 반환합니다."""
+    if not session_id:
+        return ""
+    
+    try:
+        messages = get_session_messages(session_id)
+        if not messages:
+            return ""
+        
+        # 최근 대화만 가져오기 (너무 오래된 것은 제외)
+        recent_messages = messages[-max_messages:] if len(messages) > max_messages else messages
+        
+        context_parts = []
+        for message in recent_messages:
+            role_name = "사용자" if message.role == "user" else "상담사"
+            context_parts.append(f"{role_name}: {message.content}")
+        
+        if context_parts:
+            return "\n".join(context_parts)
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"대화 컨텍스트 추출 실패: {str(e)}")
+        return ""
+
+def get_conversation_summary(session_id: str) -> str:
+    """세션의 대화 주제와 맥락을 요약합니다."""
+    if not session_id:
+        return ""
+    
+    try:
+        messages = get_session_messages(session_id)
+        if not messages or len(messages) < 2:
+            return ""
+        
+        # 사용자 메시지들만 추출하여 주제 파악
+        user_messages = [msg.content for msg in messages if msg.role == "user"]
+        if not user_messages:
+            return ""
+        
+        # 최근 3개 사용자 메시지로 주제 파악
+        recent_topics = user_messages[-3:] if len(user_messages) >= 3 else user_messages
+        
+        # 간단한 주제 키워드 추출
+        topic_keywords = []
+        for message in recent_topics:
+            content_lower = message.lower()
+            # 주요 키워드들 체크
+            if any(word in content_lower for word in ["훈련장려금", "장려금", "지급"]):
+                topic_keywords.append("훈련장려금")
+            if any(word in content_lower for word in ["출결", "출석", "지각", "조퇴"]):
+                topic_keywords.append("출결관리")
+            if any(word in content_lower for word in ["공결", "결석", "병가"]):
+                topic_keywords.append("공결신청")
+            if any(word in content_lower for word in ["줌", "온라인", "수업"]):
+                topic_keywords.append("온라인수업")
+            if any(word in content_lower for word in ["노트북", "대여", "기기"]):
+                topic_keywords.append("노트북대여")
+        
+        # 중복 제거하고 주제 요약
+        unique_topics = list(set(topic_keywords))
+        if unique_topics:
+            return f"이전 대화 주제: {', '.join(unique_topics)}"
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"대화 요약 생성 실패: {str(e)}")
+        return ""
+
+def get_conversation_flow(session_id: str) -> str:
+    """대화의 흐름과 맥락을 파악합니다."""
+    if not session_id:
+        return ""
+    
+    try:
+        messages = get_session_messages(session_id)
+        if not messages or len(messages) < 4:
+            return ""
+        
+        # 최근 대화 흐름 분석
+        recent_messages = messages[-6:] if len(messages) > 6 else messages
+        
+        flow_indicators = []
+        
+        # 질문 패턴 분석
+        for i, message in enumerate(recent_messages):
+            if message.role == "user":
+                content_lower = message.content.lower()
+                
+                # 연속 질문 패턴
+                if any(word in content_lower for word in ["그러면", "그럼", "그래서", "그렇다면"]):
+                    flow_indicators.append("연속 질문")
+                
+                # 구체화 질문 패턴
+                if any(word in content_lower for word in ["몇", "얼마", "언제", "어떻게", "왜"]):
+                    flow_indicators.append("구체적 질문")
+                
+                # 확인 질문 패턴
+                if any(word in content_lower for word in ["괜찮", "가능", "되나", "할 수 있"]):
+                    flow_indicators.append("확인 질문")
+        
+        if flow_indicators:
+            return f"대화 흐름: {', '.join(set(flow_indicators))}"
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"대화 흐름 분석 실패: {str(e)}")
+        return ""
+
+def get_user_context(session_id: str) -> str:
+    """사용자의 상황과 맥락을 파악합니다."""
+    if not session_id:
+        return ""
+    
+    try:
+        messages = get_session_messages(session_id)
+        if not messages:
+            return ""
+        
+        # 사용자 메시지에서 상황 파악
+        user_messages = [msg.content for msg in messages if msg.role == "user"]
+        if not user_messages:
+            return ""
+        
+        context_indicators = []
+        
+        for message in user_messages:
+            content_lower = message.lower()
+            
+            # 긴급성 표현
+            if any(word in content_lower for word in ["급해", "빨리", "어떻게 해야", "도와줘"]):
+                context_indicators.append("긴급 상황")
+            
+            # 불안감 표현
+            if any(word in content_lower for word in ["걱정", "불안", "어떻게 될까", "괜찮을까"]):
+                context_indicators.append("불안감")
+            
+            # 구체적 상황
+            if any(word in content_lower for word in ["몇 일", "몇 번", "몇 개", "얼마나"]):
+                context_indicators.append("구체적 상황")
+        
+        if context_indicators:
+            return f"사용자 상황: {', '.join(set(context_indicators))}"
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"사용자 맥락 분석 실패: {str(e)}")
+        return ""
+
+def get_conversation_memory(session_id: str) -> str:
+    """대화에서 언급된 구체적인 정보들을 기억합니다."""
+    if not session_id:
+        return ""
+    
+    try:
+        messages = get_session_messages(session_id)
+        if not messages:
+            return ""
+        
+        memory_items = []
+        
+        # 최근 대화에서 구체적인 정보 추출
+        recent_messages = messages[-8:] if len(messages) > 8 else messages
+        
+        for message in recent_messages:
+            if message.role == "user":
+                content = message.content
+                
+                # 숫자 정보 추출 (일수, 횟수 등)
+                import re
+                numbers = re.findall(r'\d+', content)
+                if numbers:
+                    for num in numbers:
+                        if any(word in content.lower() for word in ["일", "번", "개", "회"]):
+                            memory_items.append(f"사용자가 언급한 숫자: {num}")
+                
+                # 구체적인 상황 추출
+                if "16일" in content:
+                    memory_items.append("16일 출석 관련 질문")
+                if "80%" in content:
+                    memory_items.append("80% 출석률 관련 질문")
+                if "공결" in content:
+                    memory_items.append("공결 관련 질문")
+                if "훈련장려금" in content:
+                    memory_items.append("훈련장려금 관련 질문")
+        
+        if memory_items:
+            return f"대화 기억: {', '.join(set(memory_items))}"
+        return ""
+        
+    except Exception as e:
+        logger.warning(f"대화 기억 분석 실패: {str(e)}")
+        return ""
+
 def create_session(title: str = "새로운 대화") -> str:
     """새로운 채팅 세션 생성"""
     session_id = str(uuid.uuid4())
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -1430,7 +1963,7 @@ def create_session(title: str = "새로운 대화") -> str:
 def save_message(session_id: str, role: str, content: str, response_type: str = None, model_used: str = None) -> str:
     """메시지 저장"""
     message_id = str(uuid.uuid4())
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -1440,7 +1973,7 @@ def save_message(session_id: str, role: str, content: str, response_type: str = 
     
     # 세션 업데이트 시간 갱신
     cursor.execute('''
-        UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?
+        UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = %s
     ''', (session_id,))
     
     conn.commit()
@@ -1449,7 +1982,7 @@ def save_message(session_id: str, role: str, content: str, response_type: str = 
 
 def get_sessions() -> List[Session]:
     """모든 세션 목록 조회"""
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -1472,13 +2005,13 @@ def get_sessions() -> List[Session]:
 
 def get_session_messages(session_id: str) -> List[Message]:
     """특정 세션의 메시지 목록 조회"""
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
         SELECT id, session_id, role, content, response_type, model_used, created_at
         FROM messages 
-        WHERE session_id = ?
+        WHERE session_id = %s
         ORDER BY created_at ASC
     ''', (session_id,))
     
@@ -1499,23 +2032,23 @@ def get_session_messages(session_id: str) -> List[Message]:
 
 def delete_session(session_id: str):
     """세션과 관련 메시지 삭제"""
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
-    cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
+    cursor.execute('DELETE FROM messages WHERE session_id = %s', (session_id,))
+    cursor.execute('DELETE FROM sessions WHERE id = %s', (session_id,))
     
     conn.commit()
     conn.close()
 
 def update_session_title(session_id: str, title: str):
     """세션 제목 업데이트"""
-    conn = sqlite3.connect('chat_history.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
         UPDATE sessions SET title = ?, updated_at = CURRENT_TIMESTAMP 
-        WHERE id = ?
+        WHERE id = %s
     ''', (title, session_id))
     
     conn.commit()
@@ -1564,54 +2097,133 @@ async def call_claude(user_prompt: str, max_tokens: int = 1000, temperature: flo
         logger.error(f"Claude API 호출 실패: {str(e)}")
         return None
 
-async def call_gpt4o_mini(prompt: str, max_tokens: int = 512, temperature: float = 0.6, context_data: List[dict] = None) -> str:
-    """GPT-4o-mini API를 호출하여 응답을 받습니다."""
+async def call_claude_with_knowledge(user_prompt: str, keyword_matches: List[dict] = None, max_tokens: int = 1000, session_id: str = None) -> tuple[Optional[str], Optional[float]]:
+    """Claude가 키워드 DB 정보와 대화 컨텍스트를 참고해서 지능적인 답변을 생성
     
-    # 입력 검증
-    if not prompt or not prompt.strip():
-        return "입력이 비어있습니다."
-    
-    if not gpt_client:
-        return "GPT-4o-mini 클라이언트가 초기화되지 않았습니다. API 키를 확인해주세요."
-    
-    # 🎓 훈련 전문가로서 gpt-4o-mini 프롬프트 강화
-    system_context = """당신은 멋쟁이사자처럼 K-Digital Training 부트캠프의 전문 상담사입니다.
-
-📋 주요 분야별 정확한 정보:
-• 훈련장려금: 일일 15,800원, 80% 출석 필요, 단위기간별 지급 (2-3주 소요)
-• 출결관리: QR코드 필수, 지각/조퇴/외출 3회 = 결석 1회, HRD앱 사용
-• 공결신청: 병원진료(진단서 필요), 예비군, 경조사 등 인정, 질병공결은 10%까지
-• 줌수업: 9-18시 필수참여, 카메라 켜기 의무, 배경설정 필요
-• 수료조건: 전체 훈련일수 80% 이상 출석
-• 노트북: 개강 1주일내 신청, 반납시 원래 포장 필요
-
-친절하고 정확하게 답변하되, 규정에 관한 사항은 명확히 안내해주세요."""
-
-    enhanced_prompt = f"{system_context}\n\n질문: {prompt}"
-    
-    if context_data:
-        context_info = "\n\n관련 규정 참고:\n"
-        for i, ctx in enumerate(context_data[:3], 1):  # 상위 3개만
-            context_info += f"{i}. {ctx['question']}\n→ {ctx['answer'][:150]}{'...' if len(ctx['answer']) > 150 else ''}\n\n"
-        enhanced_prompt = f"{system_context}\n\n{context_info}질문: {prompt}\n\n위 관련 규정을 참고하여 정확하고 도움이 되는 답변을 해주세요."
+    Returns:
+        tuple[Optional[str], Optional[float]]: (응답 텍스트, 응답 시간(ms))
+    """
+    if not claude_client:
+        logger.warning("Claude 클라이언트가 초기화되지 않았습니다")
+        return None, None
     
     try:
-        logger.info("GPT-4o-mini API 호출 시작")
-        response = gpt_client.make_request(enhanced_prompt, max_tokens)
-        if response and len(response.strip()) > 5:
-            logger.info("GPT-4o-mini API 호출 성공")
-            return response
+        # Claude API 호출 시간 측정 시작
+        model_start_time = time.time()
+        # 대화 컨텍스트 가져오기
+        conversation_context = ""
+        conversation_summary = ""
+        conversation_flow = ""
+        user_context = ""
+        conversation_memory = ""
+        if session_id:
+            conversation_context = get_conversation_context(session_id)
+            conversation_summary = get_conversation_summary(session_id)
+            conversation_flow = get_conversation_flow(session_id)
+            user_context = get_user_context(session_id)
+            conversation_memory = get_conversation_memory(session_id)
+        
+        # 훈련 전문가로서의 시스템 컨텍스트
+        system_context = """당신은 멋쟁이사자처럼 K-Digital Training 부트캠프의 전문 AI 상담사입니다.
+
+🎯 주요 역할:
+- 훈련생들의 질문에 정확하고 친절하게 답변
+- 규정과 절차를 명확하게 안내
+- 복잡한 내용을 이해하기 쉽게 설명
+- 항상 도움이 되는 추가 정보나 팁 제공
+- 이전 대화 내용을 기억하고 연관성 있게 답변
+
+📋 주요 분야:
+• 훈련장려금: 일일 15,800원, 80% 출석률 필요, 단위기간별 지급
+• 출결관리: QR코드 체크, 지각/조퇴/외출 관리, HRD앱 사용
+• 공결신청: 병원, 예비군, 경조사 등 인정 사유
+• 온라인수업: 줌 참여 규정, 카메라 설정 등
+• 노트북 대여: 신청 절차, 관리 방법, 반납 규정
+• 수료 조건: 출석률, 평가 기준 등
+
+⚠️ 중요한 제한사항:
+- 오직 멋쟁이사자처럼 K-Digital Training 부트캠프와 관련된 정보만 제공
+- 다른 교육기관, 부트캠프, 코딩학원 등의 정보는 절대 제공하지 않음
+- 타사 서비스나 프로그램에 대한 질문이 들어오면 "멋쟁이사자처럼 부트캠프와 관련된 질문만 답변드릴 수 있습니다"라고 안내
+- 멋쟁이사자처럼 외의 다른 기업이나 교육기관에 대한 상세 정보 제공 금지"""
+
+        # 대화 컨텍스트가 있는 경우 추가
+        context_section = ""
+        if conversation_context:
+            context_section = f"""
+
+💬 이전 대화 내용:
+{conversation_context}
+
+{conversation_summary}
+{conversation_flow}
+{user_context}
+{conversation_memory}
+
+위 대화 내용을 참고하여 연속성 있는 답변을 해주세요. 이전에 언급된 내용이나 질문과 관련이 있다면 자연스럽게 연결하여 답변해주세요. 사용자의 상황과 감정을 고려하여 공감적이고 도움이 되는 답변을 제공해주세요. 특히 구체적인 숫자나 상황이 언급되었다면 그 맥락을 정확히 기억하고 활용해주세요."""
+
+        if keyword_matches and len(keyword_matches) > 0:
+            # 키워드 매칭된 정보들을 참고 자료로 활용
+            reference_info = "\n\n📚 참고 정보:\n"
+            for i, match in enumerate(keyword_matches[:3], 1):  # 상위 3개만
+                reference_info += f"{i}. Q: {match['question']}\n"
+                reference_info += f"   A: {match['answer'][:200]}{'...' if len(match['answer']) > 200 else ''}\n\n"
+            
+            enhanced_prompt = f"""{system_context}{context_section}
+
+{reference_info}위 참고 정보를 바탕으로 다음 질문에 정확하고 자연스럽게 답변해주세요:
+
+질문: {user_prompt}
+
+답변 가이드라인:
+1. 참고 정보의 핵심 내용을 포함하되, 기계적인 복사가 아닌 자연스러운 설명으로
+2. 이전 대화와의 연관성을 고려하여 맥락 있는 답변 제공
+3. 사용자의 상황과 감정을 이해하고 공감적인 톤으로 답변
+4. 추가적인 맥락이나 도움이 될 만한 정보가 있다면 함께 제공
+5. 규정이나 절차가 복잡하다면 단계별로 쉽게 설명
+6. 친근하면서도 전문적인 톤으로 답변
+7. 이전 대화에서 언급된 내용이 있다면 자연스럽게 연결하여 답변
+8. 사용자가 걱정하거나 불안해하는 상황이라면 안심시켜주는 표현 포함
+9. 구체적인 숫자나 날짜가 언급되었다면 그 맥락을 유지하여 답변
+10. ⚠️ 타사 정보 제공 금지: 다른 교육기관이나 부트캠프에 대한 질문이면 "멋쟁이사자처럼 부트캠프와 관련된 질문만 답변드릴 수 있습니다"라고 안내"""
         else:
-            logger.warning("GPT-4o-mini API 빈 응답")
-            return "죄송합니다. GPT-4o-mini에서 적절한 응답을 받지 못했습니다."
+            # 키워드 매칭이 없는 경우 일반 대화
+            enhanced_prompt = f"""{system_context}{context_section}
+
+다음 질문에 멋쟁이사자처럼 부트캠프 상담사로서 답변해주세요:
+
+질문: {user_prompt}
+
+답변 가이드라인:
+1. 친근하고 도움이 되는 톤으로 답변
+2. 이전 대화 내용과의 연관성을 고려하여 맥락 있는 답변
+3. 사용자의 상황과 감정을 이해하고 공감적인 톤으로 답변
+4. 부트캠프와 관련이 있다면 관련 정보나 안내 제공
+5. 일반적인 질문이라면 자연스럽게 대화
+6. 필요시 추가 질문을 유도하거나 도움 제안
+7. 이전 대화에서 언급된 내용이 있다면 자연스럽게 연결하여 답변
+8. 사용자가 걱정하거나 불안해하는 상황이라면 안심시켜주는 표현 포함
+9. 구체적인 숫자나 날짜가 언급되었다면 그 맥락을 유지하여 답변
+10. ⚠️ 타사 정보 제공 금지: 다른 교육기관이나 부트캠프에 대한 질문이면 "멋쟁이사자처럼 부트캠프와 관련된 질문만 답변드릴 수 있습니다"라고 안내"""
+        
+        # Claude API 호출
+        response = claude_client.make_request(enhanced_prompt, max_tokens)
+        
+        # Claude API 호출 시간 측정 종료
+        model_end_time = time.time()
+        model_response_time_ms = (model_end_time - model_start_time) * 1000
+        
+        if response:
+            logger.info(f"Claude 지식 기반 응답 생성 성공 (응답 시간: {model_response_time_ms:.2f}ms)")
+            return response.strip(), model_response_time_ms
+        else:
+            logger.warning("Claude 지식 기반 응답이 비어있습니다")
+            return None, model_response_time_ms
             
     except Exception as e:
-        logger.error(f"GPT-4o-mini API 호출 실패: {str(e)}")
-        return f"죄송합니다. GPT-4o-mini API 연결에 문제가 발생했습니다: {str(e)}"
-    
+        logger.error(f"Claude 지식 기반 응답 실패: {str(e)}")
+        return None, None
 
-# === Google OAuth 인증 API (임시 비활성화) ===
-# OAuth 관련 기능은 authlib 버전 문제로 임시 비활성화
 
 @app.get(
     "/",
@@ -1651,37 +2263,61 @@ async def root():
 @app.post(
     "/chat",
     response_model=ChatResponse,
-    summary="🤖 AI 챗봇 대화",
-    description="하이브리드 시스템을 사용하여 AI와 대화를 수행합니다. 키워드 기반 빠른 응답과 Ollama AI 모델을 활용합니다.",
-    response_description="AI 챗봇의 응답과 메타데이터",
+    summary="🤖 멀티 AI 챗봇 대화",
+    description="""
+    ## 🚀 하이브리드 AI 시스템
+    
+    **Claude-3-Haiku** + **키워드 DB**를 활용한 지능형 챗봇
+    
+    ### 🎯 **AI 모델 우선순위**
+    1. **Claude-3-Haiku** (기본) - 모든 대화와 전문 정보 처리
+    2. **키워드 DB** (전문) - 훈련장려금, 출결 등 전문 정보
+    
+    ### 💡 **사용법**
+    - `use_claude: true` (기본값) → Claude 지능형 응답 사용
+    - `use_claude: false` → 키워드 DB만 사용
+    
+    ### 📝 **질문 예시**
+    - 일반 대화: "안녕?", "코딩 질문 가능해?"
+    - 전문 정보: "훈련장려금은 얼마인가요?"
+    """,
+    response_description="Claude 지능형 응답 및 메타데이터 (Enhanced/Keyword)",
     tags=["Chat"]
 )
 async def chat_with_hybrid(request: ChatRequest):
     """
-    ## 🤖 AI 챗봇과 대화
+    ## 🧠 Claude 지능형 AI 챗봇과 대화
     
-    하이브리드 시스템을 사용하여 사용자와 AI 간의 대화를 처리합니다.
+    Claude가 키워드 DB를 참고해서 지능적이고 자연스러운 답변을 생성하는 시스템입니다.
     
-    ### 🔄 처리 방식
-    1. **1단계**: 키워드 기반 빠른 응답 검색
-    2. **2단계**: 키워드 매칭 실패 시 Ollama AI 모델 사용
+    ### 🚀 처리 방식 (NEW!)
+    1. **키워드 검색**: 관련 정보를 DB에서 검색
+    2. **Claude 분석**: 검색된 정보를 참고해서 지능적 답변 생성
+    3. **자연스러운 응답**: 기계적이지 않은 상담사 톤의 답변 제공
     
     ### 📝 요청 데이터
     - **prompt**: 사용자 질문 (필수)
-    - **max_new_tokens**: 최대 토큰 수 (기본값: 512)
-    - **temperature**: 창의성 조절 (기본값: 0.6)
-    - **use_ollama**: Ollama 사용 여부 (기본값: true)
+    - **max_new_tokens**: Claude 응답 길이 (기본값: 1000)
+    - **temperature**: 창의성 조절 (기본값: 0.7)
+    - **use_claude**: Claude 사용 여부 (기본값: true)
+    - **session_id**: 대화 세션 ID (선택사항)
     
     ### 🎯 응답 유형
-    - **keyword**: 키워드 기반 빠른 응답
-    - **ollama**: AI 모델 생성 응답
+    - **claude_enhanced**: Claude가 키워드 DB 참고한 지능적 응답
+    - **keyword**: 키워드 기반 응답 (Claude 실패 시)
     - **fallback**: 기본 안내 응답
     
     ### 💡 주요 기능
-    - 훈련장려금, 출결, 공결 관련 즉시 답변
-    - 줌, 수업, 노트북 관련 정보 제공
-    - 취업, 인턴십, 커리어 상담 안내
+    - 🎓 훈련장려금, 출결, 공결 관련 전문 상담
+    - 💻 줌, 수업, 노트북 관련 자세한 안내
+    - 🚀 취업, 인턴십, 커리어 맞춤 조언
+    - 📚 추가 팁과 단계별 가이드 제공
+    - 🤝 친근하고 전문적인 상담사 톤
     """
+    
+    # 전체 응답 시간 측정 시작
+    total_start_time = time.time()
+    model_response_time_ms = None
     
     try:
         # 입력 검증
@@ -1691,81 +2327,84 @@ async def chat_with_hybrid(request: ChatRequest):
         # 간단한 로깅 (선택적)
         logger.info(f"사용자 질문: {request.prompt}")
         
-        # 🚀 채팅 모드: Claude 모델 우선 사용
+        # 🚀 지능형 Claude 시스템: 키워드 DB + AI 하이브리드
         if request.use_claude:
-            logger.info("채팅 모드: Claude 모델 우선 사용")
+            logger.info("🧠 Claude 지능형 응답 시스템 시작")
             
-            # 질문 의도 분석
-            user_intent = analyze_question_intent(request.prompt)
-            logger.info(f"질문 의도 분석: {user_intent}")
+            # 1단계: 관련 키워드 정보 검색
+            related_data = find_related_questions_smart(
+                request.prompt, 
+                limit=5,
+                min_score=0.2,
+                context_keywords=[]
+            )
             
-            # 일반 대화인 경우 바로 Claude 사용
-            if user_intent.get("is_general_conversation", False):
-                logger.info("일반 대화 감지 - Claude 직접 사용")
-                try:
-                    ai_response = await call_claude(
-                        request.prompt, 
-                        request.max_new_tokens, 
-                        request.temperature,
-                        context_data=[]
+            # 2단계: Claude가 키워드 정보를 참고해서 지능적 답변 생성
+            try:
+                ai_response, model_response_time_ms = await call_claude_with_knowledge(
+                    request.prompt,
+                    keyword_matches=related_data,
+                    max_tokens=request.max_new_tokens,
+                    session_id=request.session_id
+                )
+                
+                if ai_response and len(ai_response.strip()) > 10:
+                    # 관련 질문들 변환
+                    related_questions = []
+                    if related_data:
+                        for rq in related_data[:4]:
+                            related_questions.append(RelatedQuestion(
+                                id=str(rq.get("id", "unknown")),
+                                question=rq["question"],
+                                answer_preview=rq["answer"][:100] + "...",
+                                score=rq["score"],
+                                matched_keywords=rq.get("matched_keywords", [])
+                            ))
+                    
+                    # 📝 대화 기록 저장
+                    if request.session_id:
+                        try:
+                            save_message(request.session_id, "user", request.prompt)
+                            save_message(request.session_id, "assistant", ai_response, 
+                                       response_type="claude_enhanced", model_used="Claude-3-Haiku + Knowledge Base")
+                        except Exception as e:
+                            logger.warning(f"대화 기록 저장 실패: {str(e)}")
+                    
+                    # 전체 응답 시간 계산
+                    total_response_time_ms = (time.time() - total_start_time) * 1000
+                    
+                    logger.info(f"✅ Claude 지능형 응답 생성 성공 (전체: {total_response_time_ms:.2f}ms, 모델: {model_response_time_ms:.2f}ms)")
+                    return ChatResponse(
+                        response=ai_response,
+                        model="Claude-3-Haiku + Knowledge Base",
+                        status="success",
+                        matched_keywords=[kw for item in related_data for kw in item.get("matched_keywords", [])][:5],
+                        response_type="claude_enhanced",
+                        related_questions=related_questions,
+                        total_related=len(related_data),
+                        response_time_ms=total_response_time_ms,
+                        model_response_time_ms=model_response_time_ms
                     )
                     
-                    if ai_response and len(ai_response.strip()) > 5:
-                        return ChatResponse(
-                            response=ai_response,
-                            model="Claude-3-Haiku",
-                            status="success",
-                            matched_keywords=[],
-                            response_type="claude_chat",
-                            related_questions=None,
-                            total_related=0
-                        )
-                except Exception as e:
-                    logger.error(f"Claude 일반 대화 실패: {str(e)}")
+            except Exception as e:
+                logger.error(f"Claude 지능형 응답 실패: {str(e)}")
+                # Claude 실패 시 키워드 DB로 fallback
         
-        # 🔄 GPT-4o-mini 모델 사용 (Claude 실패 시 또는 직접 사용)
-        elif request.use_gpt4o:
-            logger.info("채팅 모드: GPT-4o-mini 모델 우선 사용")
+        # 🔍 Claude를 사용하지 않는 경우: 키워드 기반 처리
+        else:
+            logger.info("키워드 기반 처리 모드")
             
             # 질문 의도 분석
             user_intent = analyze_question_intent(request.prompt)
             logger.info(f"질문 의도 분석: {user_intent}")
             
-            # 일반 대화인 경우 바로 GPT-4o-mini 사용 (키워드 검색 생략)
-            if user_intent.get("is_general_conversation", False):
-                logger.info("일반 대화 감지 - GPT-4o-mini 직접 사용")
-                try:
-                    ai_response = await call_gpt4o_mini(
-                        request.prompt, 
-                        request.max_new_tokens, 
-                        request.temperature,
-                        context_data=[]  # 일반 대화는 컨텍스트 없이
-                    )
-                    
-                    if ai_response and "연결할 수 없습니다" not in ai_response and len(ai_response.strip()) > 5:
-                        # 📝 대화 기록 저장
-                        if request.session_id:
-                            try:
-                                save_message(request.session_id, "user", request.prompt)
-                                save_message(request.session_id, "assistant", ai_response, 
-                                           response_type="gpt4o_chat", model_used="gpt-3.5-turbo (General Chat)")
-                            except Exception as e:
-                                logger.warning(f"대화 기록 저장 실패: {str(e)}")
-                        
-                        logger.info("GPT-4o-mini 일반 대화 응답 성공")
-                        return ChatResponse(
-                            response=ai_response,
-                            model="gpt-3.5-turbo (General Chat)",
-                            status="success",
-                            matched_keywords=[],
-                            response_type="gpt4o_chat",
-                            related_questions=None,
-                            total_related=0
-                        )
-                except Exception as e:
-                    logger.error(f"GPT-4o-mini 일반 대화 실패: {str(e)}")
-            # GPT-4o-mini를 사용하지 않거나 실패 시 일반 대화 처리
-            if user_intent.get("is_general_conversation", False):
+            # 타사 정보 질문인 경우 제한 응답
+            if user_intent.get("is_competitor_question", False):
+                logger.info("타사 정보 질문 감지 - 제한 응답 제공")
+                response = "죄송합니다. 저는 멋쟁이사자처럼 K-Digital Training 부트캠프와 관련된 질문만 답변드릴 수 있습니다. 멋쟁이사자처럼 부트캠프에 대해 궁금한 점이 있으시면 언제든지 물어보세요!"
+            
+            # 일반 대화인 경우 기본 응답 제공
+            elif user_intent.get("is_general_conversation", False):
                 logger.info("일반 대화 감지 - 기본 응답 제공")
                 # 입력에 따른 적절한 응답 선택
                 user_input_lower = request.prompt.lower().strip()
@@ -1779,6 +2418,7 @@ async def chat_with_hybrid(request: ChatRequest):
                 else:
                     response = "안녕하세요! 무엇을 도와드릴까요? 훈련장려금, 출결, 공결 등 궁금한 점을 물어보세요."
                 
+                total_response_time_ms = (time.time() - total_start_time) * 1000
                 return ChatResponse(
                     response=response,
                     model="Smart Intent-based Response System",
@@ -1786,88 +2426,30 @@ async def chat_with_hybrid(request: ChatRequest):
                     matched_keywords=[],
                     response_type="fallback",
                     related_questions=None,
-                    total_related=0
+                    total_related=0,
+                    response_time_ms=total_response_time_ms,
+                    model_response_time_ms=None
                 )
             
-            # 훈련 관련 질문인 경우만 컨텍스트 검색 수행
+            # 훈련 관련 질문인 경우 컨텍스트 검색 수행
             context_keywords = get_context_keywords(request.session_id) if request.session_id else []
             if context_keywords:
                 logger.info(f"컨텍스트 키워드: {context_keywords}")
-            
-            # 관련 질문들 검색 (컨텍스트 제공용)
-            related_questions_data = find_related_questions_smart(
-                request.prompt, 
-                limit=5,  # 컨텍스트용으로 적당히
-                min_score=0.5,  # 관련성 있는 것만
-                context_keywords=context_keywords
-            )
-            
-            # 🤖 GPT-4o-mini 모델 우선 사용 (항상 먼저 시도)
-            try:
-                ai_response = await call_gpt4o_mini(
-                    request.prompt, 
-                    request.max_new_tokens, 
-                    request.temperature,
-                    context_data=related_questions_data  # 관련 QA 데이터 컨텍스트 제공
-                )
-                model_name = "gpt-3.5-turbo"
-                
-                # GPT-4o-mini 응답이 성공적인 경우 (항상 우선 반환)
-                if ai_response and "연결할 수 없습니다" not in ai_response and "API 연결에 문제가 발생했습니다" not in ai_response and len(ai_response.strip()) > 5:
-                    # 관련 질문들을 추천으로 제공 (높은 점수만)
-                    related_questions = []
-                    for rq in related_questions_data[:3]:  # 상위 3개만
-                        if rq["score"] > 4.0:  # 훨씬 높은 점수만 (정말 관련성이 확실한 것만)
-                            answer_preview = rq["answer"]
-                            if len(answer_preview) > 80:
-                                answer_preview = answer_preview[:80] + "..."
-                            
-                            related_questions.append(RelatedQuestion(
-                                id=rq["id"],
-                                question=rq["question"],
-                                answer_preview=answer_preview,
-                                score=rq["score"],
-                                matched_keywords=rq["matched_keywords"]
-                            ))
-                    
-                    # 📝 대화 기록 저장 (GPT-4o-mini 성공 시)
-                    if request.session_id:
-                        try:
-                            save_message(request.session_id, "user", request.prompt)
-                            save_message(request.session_id, "assistant", ai_response, 
-                                       response_type="gpt4o_chat", model_used=f"{model_name} (Chat Mode)")
-                        except Exception as e:
-                            logger.warning(f"대화 기록 저장 실패: {str(e)}")
-                    
-                    logger.info(f"{model_name} 모델 응답 성공 (우선 반환)")
-                    return ChatResponse(
-                        response=ai_response,
-                        model=f"{model_name} (Chat Mode)",
-                        status="success",
-                        matched_keywords=[],
-                        response_type="gpt4o_chat",
-                        related_questions=related_questions if related_questions else None,
-                        total_related=len(related_questions) if related_questions else 0
-                    )
-                else:
-                    logger.warning(f"{model_name} 응답이 빈 응답이거나 오류 메시지")
-            except Exception as e:
-                logger.error(f"{model_name} 모델 사용 실패: {str(e)}")
-            
-            # GPT-4o-mini 실패 시에만 QA 데이터베이스로 fallback
-            logger.info("GPT-4o-mini 실패, QA 데이터베이스로 전환")
         
-        # GPT-4o-mini를 사용하지 않거나 실패한 경우에만 키워드 기반 처리 진행
-        
-        # 🔍 검색 모드 또는 GPT-4o-mini 실패 시: 키워드 기반 처리
+        # 🔍 키워드 기반 처리
         logger.info("키워드 기반 검색 모드 시작")
         
         # 📌 먼저 일반 대화 체크 (키워드 검색 전에)
         user_intent = analyze_question_intent(request.prompt)
         logger.info(f"질문 의도 분석: {user_intent}")
         
+        # 타사 정보 질문인 경우 제한 응답
+        if user_intent.get("is_competitor_question", False):
+            logger.info("타사 정보 질문 감지 - 제한 응답 제공")
+            response = "죄송합니다. 저는 멋쟁이사자처럼 K-Digital Training 부트캠프와 관련된 질문만 답변드릴 수 있습니다. 멋쟁이사자처럼 부트캠프에 대해 궁금한 점이 있으시면 언제든지 물어보세요!"
+        
         # 일반 대화인 경우 키워드 검색 우회하고 바로 기본 응답
-        if user_intent.get("is_general_conversation", False):
+        elif user_intent.get("is_general_conversation", False):
             logger.info("일반 대화 감지 - 키워드 검색 우회하고 기본 응답 제공")
             user_input_lower = request.prompt.lower().strip()
             
@@ -1880,6 +2462,7 @@ async def chat_with_hybrid(request: ChatRequest):
             else:
                 response = "안녕하세요! 무엇을 도와드릴까요? 훈련장려금, 출결, 공결 등 궁금한 점을 물어보세요."
             
+            total_response_time_ms = (time.time() - total_start_time) * 1000
             return ChatResponse(
                 response=response,
                 model="Smart Intent-based Response System",
@@ -1887,7 +2470,9 @@ async def chat_with_hybrid(request: ChatRequest):
                 matched_keywords=[],
                 response_type="general_greeting",
                 related_questions=None,
-                total_related=0
+                total_related=0,
+                response_time_ms=total_response_time_ms,
+                model_response_time_ms=None
             )
         
         # 컨텍스트 키워드 추출
@@ -1907,7 +2492,7 @@ async def chat_with_hybrid(request: ChatRequest):
         )
         related_questions = []
         
-        # 🎯 키워드 기반 답변 선택 로직 (검색 모드 또는 GPT-4o-mini 실패 시)
+        # 🎯 키워드 기반 답변 선택 로직
         if related_questions_data and len(related_questions_data) > 0:
             # 최고 점수 질문을 주 답변으로 선택
             best_question = related_questions_data[0]
@@ -1982,37 +2567,20 @@ async def chat_with_hybrid(request: ChatRequest):
                             matched_keywords=rq["matched_keywords"]
                         ))
             else:
-                # 진짜로 관련 없는 경우만 GPT-4o-mini 사용
-                if request.use_gpt4o:
-                    ai_response = await call_gpt4o_mini(
-                        request.prompt, 
-                        request.max_new_tokens, 
-                        request.temperature
-                    )
-                    
-                    if "연결할 수 없습니다" in ai_response or "API 연결에 문제가 발생했습니다" in ai_response or "죄송합니다" in ai_response:
-                        response = "죄송합니다. 해당 질문에 대한 정확한 답변을 찾을 수 없습니다.\n\n구체적인 키워드(예: 훈련장려금, 출결, 줌 등)로 다시 질문해주시면 도움을 드릴 수 있습니다."
-                        status = "fallback"
-                        response_type = "fallback"
-                        model_name = "Smart Intent-based Response System"
-                        matched_keywords = []
-                    else:
-                        response = ai_response
-                        status = "success"
-                        response_type = "gpt4o"
-                        model_name = "gpt-3.5-turbo"
-                        matched_keywords = []
-                else:
-                    response = "죄송합니다. 해당 질문에 대한 정확한 답변을 찾을 수 없습니다.\n\n구체적인 키워드(예: 훈련장려금, 출결, 줌 등)로 다시 질문해주시면 도움을 드릴 수 있습니다."
-                    status = "no_match"
-                    response_type = "fallback"
-                    model_name = "Smart Intent-based Response System"
-                    matched_keywords = []
+                # 관련 없는 경우 기본 안내 메시지 제공
+                response = "죄송합니다. 해당 질문에 대한 정확한 답변을 찾을 수 없습니다.\n\n구체적인 키워드(예: 훈련장려금, 출결, 줌 등)로 다시 질문해주시면 도움을 드릴 수 있습니다."
+                status = "no_match"
+                response_type = "fallback"
+                model_name = "Smart Intent-based Response System"
+                matched_keywords = []
         
         # 응답 데이터 유효성 검사
         if not response:
             response = "죄송합니다. 응답을 생성할 수 없습니다."
             status = "error"
+        
+        # 전체 응답 시간 계산
+        total_response_time_ms = (time.time() - total_start_time) * 1000
         
         # 응답 객체 생성
         chat_response = ChatResponse(
@@ -2022,7 +2590,9 @@ async def chat_with_hybrid(request: ChatRequest):
             matched_keywords=matched_keywords if matched_keywords else [],
             response_type=response_type,
             related_questions=related_questions[:4] if related_questions else None,  # 최대 4개까지
-            total_related=len(related_questions) if related_questions else 0
+            total_related=len(related_questions) if related_questions else 0,
+            response_time_ms=total_response_time_ms,
+            model_response_time_ms=model_response_time_ms
         )
         
         # 대화 기록 저장 (세션 ID가 있는 경우)
@@ -2096,34 +2666,20 @@ def health_check():
         except:
             claude_status = "error"
     
-    # GPT-4o-mini 상태 확인
-    gpt4o_status = "disconnected"
-    if gpt_client:
-        try:
-            # 간단한 연결 테스트
-            test_result = gpt_client.test_connection()
-            gpt4o_status = "connected" if test_result else "error"
-        except:
-            gpt4o_status = "error"
-    
     available_models = []
     if claude_status == "connected":
         available_models.append("Claude-3-Haiku")
-    if gpt4o_status == "connected":
-        available_models.append("GPT-4o-mini")
     available_models.append("Keyword-based")
     
     return {
         "status": "healthy",
-        "model": f"Hybrid: {' + '.join(available_models)}",
+        "model": f"Intelligent: {' + '.join(available_models)}",
         "device": "CPU",
         "language": "Korean",
         "qa_count": len(QA_DATABASE),
         "claude_status": claude_status,
         "claude_available": bool(claude_client),
-        "gpt4o_status": gpt4o_status,
-        "gpt4o_available": bool(gpt_client),
-        "response_mode": "claude_gpt4o_keyword_hybrid",
+        "response_mode": "claude_enhanced_knowledge",
         "timeout_settings": "30s_graceful"
     }
 
@@ -2148,26 +2704,22 @@ def get_info():
     - **Ollama 모델**: 사용 중인 AI 모델명
     """
     available_ai_models = []
-    if gpt_client:
-        available_ai_models.append("GPT-4o-mini")
+    if claude_client:
+        available_ai_models.append("Claude-3-Haiku")
     
     return {
-        "model_name": f"Hybrid System: Keyword-based + {' + '.join(available_ai_models) if available_ai_models else 'Keyword-based'}",
-        "model_type": "Hybrid AI System",
-        "description": "키워드 기반 빠른 응답 + GPT-4o-mini 하이브리드 시스템",
+        "model_name": f"Intelligent System: {' + '.join(available_ai_models) if available_ai_models else 'Keyword-based'}",
+        "model_type": "Claude-Enhanced Knowledge System",
+        "description": "Claude가 키워드 DB를 참고해서 지능적 답변을 생성하는 시스템",
         "capabilities": [
             "한국어 대화",
-            "빠른 질문 답변 (키워드 기반)",
-            "AI 생성 응답 (GPT-4o-mini)",
-            "키워드 매칭",
-            "훈련 관련 정보 제공"
+            "지능형 질문 답변 (Claude + Knowledge Base)",
+            "키워드 기반 정보 검색",
+            "자연스러운 AI 응답",
+            "훈련 관련 전문 정보 제공",
+            "맥락 기반 추가 안내"
         ],
         "available_models": {
-            "gpt4o_mini": {
-                "available": bool(gpt_client),
-                "model": "gpt-3.5-turbo",
-                "provider": "OpenAI"
-            },
             "keyword_based": {
                 "available": True,
                 "qa_topics_count": len(QA_DATABASE)
@@ -2580,13 +3132,334 @@ def get_session_info(session_id: str):
             return session
     raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
 
+# 슬랙 관련 엔드포인트들
+@app.post(
+    "/slack/sync",
+    summary="🔄 슬랙 이슈 동기화",
+    description="슬랙 채널에서 이슈 메시지를 가져와서 데이터베이스에 저장합니다.",
+    response_description="동기화 결과",
+    tags=["Slack"]
+)
+async def sync_slack_issues_endpoint(request: SlackSyncRequest):
+    """
+    ## 🔄 슬랙 이슈 동기화
+    
+    지정된 슬랙 채널에서 이슈 알림 메시지를 가져와서 데이터베이스에 저장합니다.
+    
+    ### 📝 요청 데이터
+    - **hours**: 동기화할 시간 범위 (기본값: 24시간)
+    - **force**: 강제 동기화 여부 (기본값: false)
+    
+    ### 📋 응답 데이터
+    - **success**: 동기화 성공 여부
+    - **message**: 결과 메시지
+    - **new_issues**: 새로 추가된 이슈 수
+    - **skipped_issues**: 건너뛴 이슈 수 (중복)
+    - **errors**: 오류 발생 수
+    - **total_messages**: 처리된 총 메시지 수
+    
+    ### 💡 활용 방법
+    - 정기적으로 호출하여 새로운 이슈 수집
+    - 중복 데이터는 자동으로 건너뜀
+    - 파싱 가능한 이슈 메시지만 저장
+    """
+    if not SLACK_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="슬랙 봇 토큰이 설정되지 않았습니다. SLACK_BOT_TOKEN 환경변수를 설정해주세요.")
+    
+    result = await sync_slack_issues(request.hours, request.force)
+    return result
+
+@app.get(
+    "/slack/issues",
+    response_model=List[SlackIssue],
+    summary="📋 슬랙 이슈 목록 조회",
+    description="저장된 슬랙 이슈들을 조회합니다.",
+    response_description="슬랙 이슈 목록",
+    tags=["Slack"]
+)
+def list_slack_issues_endpoint(
+    limit: Optional[int] = 50,
+    project: Optional[str] = None
+):
+    """
+    ## 📋 슬랙 이슈 목록 조회
+    
+    데이터베이스에 저장된 슬랙 이슈들을 조회합니다.
+    
+    ### 🔍 쿼리 매개변수
+    - **limit**: 조회할 최대 이슈 수 (기본값: 50)
+    - **project**: 프로젝트명으로 필터링 (선택)
+    
+    ### 📋 응답 데이터
+    각 이슈는 다음 정보를 포함합니다:
+    - **id**: 이슈 고유 ID
+    - **project**: 프로젝트/과정명
+    - **issue_type**: 이슈 유형 (프론트엔드, 백엔드, 훈련장려금 등)
+    - **author**: 작성자
+    - **content**: 이슈 내용
+    - **raw_message**: 원본 슬랙 메시지
+    - **created_at**: 저장 시간
+    
+    ### 💡 활용 방법
+    - 최근 이슈 현황 파악
+    - 프로젝트별 이슈 필터링
+    - 이슈 통계 및 분석
+    """
+    return get_slack_issues(limit=limit, project=project)
+
+@app.get(
+    "/slack/issues/stats",
+    summary="📊 슬랙 이슈 통계",
+    description="저장된 슬랙 이슈들의 통계 정보를 제공합니다.",
+    response_description="이슈 통계 정보",
+    tags=["Slack"]
+)
+def get_slack_issue_stats():
+    """
+    ## 📊 슬랙 이슈 통계
+    
+    저장된 슬랙 이슈들의 다양한 통계 정보를 제공합니다.
+    
+    ### 📋 응답 데이터
+    - **total_issues**: 총 이슈 수
+    - **by_project**: 프로젝트별 이슈 수
+    - **by_type**: 이슈 유형별 수
+    - **by_author**: 작성자별 이슈 수
+    - **recent_issues**: 최근 이슈들 (최대 10개)
+    
+    ### 💡 활용 방법
+    - 이슈 현황 대시보드
+    - 프로젝트별 이슈 분포 파악
+    - 작성자별 활동 분석
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 총 이슈 수
+        cursor.execute("SELECT COUNT(*) FROM slack_issues")
+        total_issues = cursor.fetchone()[0]
+        
+        # 프로젝트별 통계
+        cursor.execute("""
+            SELECT project, COUNT(*) as count 
+            FROM slack_issues 
+            GROUP BY project 
+            ORDER BY count DESC
+        """)
+        by_project = dict(cursor.fetchall())
+        
+        # 이슈 유형별 통계
+        cursor.execute("""
+            SELECT issue_type, COUNT(*) as count 
+            FROM slack_issues 
+            GROUP BY issue_type 
+            ORDER BY count DESC
+        """)
+        by_type = dict(cursor.fetchall())
+        
+        # 작성자별 통계
+        cursor.execute("""
+            SELECT author, COUNT(*) as count 
+            FROM slack_issues 
+            GROUP BY author 
+            ORDER BY count DESC 
+            LIMIT 10
+        """)
+        by_author = dict(cursor.fetchall())
+        
+        # 최근 이슈들
+        cursor.execute("""
+            SELECT project, issue_type, author, content, created_at
+            FROM slack_issues 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        """)
+        recent_rows = cursor.fetchall()
+        recent_issues = [
+            {
+                "project": row[0],
+                "issue_type": row[1],
+                "author": row[2],
+                "content": row[3][:100] + "..." if len(row[3]) > 100 else row[3],
+                "created_at": row[4]
+            }
+            for row in recent_rows
+        ]
+        
+        return {
+            "total_issues": total_issues,
+            "by_project": by_project,
+            "by_type": by_type,
+            "by_author": by_author,
+            "recent_issues": recent_issues
+        }
+        
+    finally:
+        conn.close()
+
+# 피드백 및 개선 관련 엔드포인트들
+@app.post(
+    "/feedback",
+    summary="📝 답변 피드백 제출",
+    description="AI 답변에 대한 사용자 피드백을 수집합니다.",
+    response_description="피드백 저장 결과",
+    tags=["Feedback"]
+)
+async def submit_feedback(request: FeedbackRequest):
+    """
+    ## 📝 답변 피드백 제출
+    
+    AI 답변에 대한 사용자 피드백을 수집하여 답변 품질 개선에 활용합니다.
+    
+    ### 📝 요청 데이터
+    - **session_id**: 세션 ID
+    - **message_id**: 메시지 ID
+    - **feedback_type**: 피드백 유형 (positive, negative, correction)
+    - **feedback_content**: 피드백 내용 (선택사항)
+    - **user_correction**: 사용자 수정 내용 (correction 타입일 때)
+    
+    ### 📋 응답 데이터
+    - **success**: 저장 성공 여부
+    - **message**: 결과 메시지
+    """
+    try:
+        # 해당 메시지 정보 가져오기
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT content FROM messages 
+            WHERE id = %s AND session_id = ?
+        ''', (request.message_id, request.session_id))
+        
+        message_result = cursor.fetchone()
+        if not message_result:
+            conn.close()
+            raise HTTPException(status_code=404, detail="메시지를 찾을 수 없습니다.")
+        
+        # 사용자 질문과 AI 답변 구분 (간단한 방식)
+        ai_answer = message_result[0]
+        
+        # 이전 사용자 메시지 찾기
+        cursor.execute('''
+            SELECT content FROM messages 
+            WHERE session_id = %s AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT 1
+        ''', (request.session_id,))
+        
+        user_question_result = cursor.fetchone()
+        user_question = user_question_result[0] if user_question_result else "질문을 찾을 수 없음"
+        
+        conn.close()
+        
+        # 피드백 저장
+        success = save_answer_feedback(
+            session_id=request.session_id,
+            message_id=request.message_id,
+            user_question=user_question,
+            ai_answer=ai_answer,
+            feedback_type=request.feedback_type,
+            feedback_content=request.feedback_content,
+            user_correction=request.user_correction
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": "피드백이 성공적으로 저장되었습니다."
+            }
+        else:
+            raise HTTPException(status_code=500, detail="피드백 저장에 실패했습니다.")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"피드백 처리 오류: {str(e)}")
+
+@app.get(
+    "/feedback/analysis",
+    summary="📊 피드백 분석 결과",
+    description="수집된 피드백을 분석하여 개선점을 제시합니다.",
+    response_description="피드백 분석 결과",
+    tags=["Feedback"]
+)
+def get_feedback_analysis():
+    """
+    ## 📊 피드백 분석 결과
+    
+    수집된 사용자 피드백을 분석하여 답변 품질 개선점을 제시합니다.
+    
+    ### 📋 응답 데이터
+    - **problematic_questions**: 부정적 피드백이 많은 질문들
+    - **common_corrections**: 자주 수정되는 답변 패턴들
+    - **feedback_stats**: 전체 피드백 통계
+    """
+    try:
+        analysis_result = analyze_feedback_patterns()
+        return {
+            "success": True,
+            "data": analysis_result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"피드백 분석 오류: {str(e)}")
+
+@app.get(
+    "/improvement/suggestions",
+    summary="💡 답변 개선 제안",
+    description="슬랙 이슈와 피드백을 기반으로 답변 개선 제안을 생성합니다.",
+    response_description="개선 제안 목록",
+    tags=["Feedback"]
+)
+def get_improvement_suggestions():
+    """
+    ## 💡 답변 개선 제안
+    
+    슬랙 이슈 데이터와 사용자 피드백을 분석하여 답변 품질 개선 제안을 생성합니다.
+    
+    ### 📋 응답 데이터
+    - **suggestions**: 개선 제안 목록
+    - **priority_issues**: 우선순위가 높은 이슈들
+    - **improvement_areas**: 개선이 필요한 영역들
+    """
+    try:
+        # 슬랙 이슈 기반 제안
+        issue_suggestions = get_improvement_suggestions_from_issues()
+        
+        # 피드백 기반 분석
+        feedback_analysis = analyze_feedback_patterns()
+        
+        # 우선순위 이슈 식별
+        priority_issues = [s for s in issue_suggestions if s.get("priority") == "high"]
+        
+        # 개선 영역 분류
+        improvement_areas = {}
+        for suggestion in issue_suggestions:
+            area = suggestion.get("issue_type", "기타")
+            if area not in improvement_areas:
+                improvement_areas[area] = []
+            improvement_areas[area].append(suggestion)
+        
+        return {
+            "success": True,
+            "data": {
+                "suggestions": issue_suggestions,
+                "priority_issues": priority_issues,
+                "improvement_areas": improvement_areas,
+                "feedback_analysis": feedback_analysis
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"개선 제안 생성 오류: {str(e)}")
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8001))
     
     print("🚀 멋쟁이사자처럼 AI 챗봇 서버 시작!")
     print(f"📍 포트: {port}")
     print(f"🤖 Claude: {'✅ 연결됨' if claude_client else '❌ 연결 안됨'}")
-    print(f"🤖 GPT-4o-mini: {'✅ 연결됨' if gpt_client else '❌ 연결 안됨'}")
+# GPT 관련 코드 제거됨
     print(f"📚 QA 데이터베이스: {len(QA_DATABASE)}개 항목 로드됨")
     print("🌐 http://localhost:8001 에서 접속 가능합니다")
     
